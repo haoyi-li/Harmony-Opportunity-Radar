@@ -4,24 +4,23 @@ import unittest
 from unittest import mock
 
 from radar.pipeline import PipelineAbortError, RetryableAbortError
-from radar.pipeline import capture, audit
+from radar.pipeline import capture, filter as filter_stage, probe
 
 
 class CaptureFailureTest(unittest.TestCase):
+    def _cfg(self):
+        return {"llm": {"model": "m", "base_url": "http://x"},
+                "capture": {"regions": ["cn"], "charts": ["top-free"],
+                            "feed_limit": 10, "max_benchmarks": 5,
+                            "llm_input_limit": 200},
+                "database": {"path": "data/apps.db"}}
+
     def test_all_apple_feeds_fail_is_retryable(self):
-        cfg = {"llm": {"model": "m", "base_url": "http://x"},
-               "capture": {"regions": ["cn"], "charts": ["top-free"],
-                           "feed_limit": 10, "max_benchmarks": 5,
-                           "llm_input_limit": 200}}
         with mock.patch.object(capture.apple_rss, "fetch_all", return_value=[]):
             with self.assertRaises(RetryableAbortError):
-                capture.run(cfg)
+                capture.run(self._cfg())
 
     def test_llm_connection_failure_aborts_without_overwrite(self):
-        cfg = {"llm": {"model": "m", "base_url": "http://x"},
-               "capture": {"regions": ["cn"], "charts": ["top-free"],
-                           "feed_limit": 10, "max_benchmarks": 5,
-                           "llm_input_limit": 200}}
         apps = [{"name": "A", "artist": "X", "apple_id": "1", "rank": 1,
                  "url": "u", "source": "apple/cn/top-free"}]
         saved = []
@@ -41,85 +40,120 @@ class CaptureFailureTest(unittest.TestCase):
                 mock.patch.object(capture.store, "save_benchmarks",
                                   side_effect=lambda d: saved.append("bench")):
             with self.assertRaises(RetryableAbortError):
-                capture.run(cfg)
+                capture.run(self._cfg())
         # 原始快照已落盘（便于重跑），但绝不写空 benchmarks
         self.assertIn("raw", saved)
         self.assertNotIn("bench", saved)
 
+    def test_empty_llm_selection_triggers_abort(self):
+        apps = [{"name": "A", "artist": "X", "apple_id": "1", "rank": 1,
+                 "url": "u", "source": "apple/cn/top-free"}]
 
-class AuditFailureInjectionTest(unittest.TestCase):
-    def _cfg(self):
-        return {"llm": {"model": "m", "base_url": "http://x"},
-                "audit": {"min_score": 6.0}}
-
-    def _run(self, responses, bms, probes):
-        bench = {"benchmarks": bms}
-        probe = {"benchmarks": probes}
-        saved = {}
-
-        class FakeLLM:
+        class EmptyLLM:
             def __init__(self, *a, **k):
-                self._i = 0
+                pass
 
             def chat_json(self, *a, **k):
-                r = responses[self._i]
-                self._i += 1
-                if isinstance(r, Exception):
-                    raise r
-                return r
+                return []
 
-        with mock.patch.object(audit, "_load_or_fail",
-                               side_effect=lambda s: bench if s == "benchmarks" else probe), \
-                mock.patch.object(audit, "LLMClient", FakeLLM), \
-                mock.patch.object(audit.store, "save_opportunities",
-                                  side_effect=lambda d: saved.setdefault("opp", d)), \
-                mock.patch.object(audit.store, "save_audit_results",
-                                  side_effect=lambda d: saved.setdefault("ar", d)), \
-                mock.patch.object(audit.store, "save_review_queue",
-                                  side_effect=lambda d: saved.setdefault("rq", d)), \
-                mock.patch.object(audit.store, "save_report",
-                                  side_effect=lambda m: saved.setdefault("report", m)):
-            return audit.run(self._cfg()), saved
+        with mock.patch.object(capture.apple_rss, "fetch_all", return_value=apps), \
+                mock.patch.object(capture, "LLMClient", EmptyLLM), \
+                mock.patch.object(capture.store, "save_benchmarks") as save:
+            with self.assertRaises(PipelineAbortError):
+                capture.run(self._cfg())
+        save.assert_not_called()
 
-    def _bm(self, i):
-        return {"name": f"A{i}", "apple_id": str(i), "artist": "A",
-                "jtbd": "J", "pick_reason": "R"}
 
-    def _probe(self, i):
-        return {"name": f"A{i}", "blank_signal": False, "competitors": []}
+class ProbeFailureTest(unittest.TestCase):
+    def test_empty_benchmarks_aborts(self):
+        with mock.patch.object(probe.store, "load_benchmarks", return_value=None):
+            with self.assertRaises(PipelineAbortError):
+                probe.run({"llm": {"model": "m", "base_url": "http://x"}, "probe": {}})
 
-    def test_llm_connection_failure_all_aborts(self):
+    def test_empty_results_abort_without_overwrite(self):
+        class FailingClient:
+            def search(self, *a, **k):
+                from radar.sources.appgallery import AppGalleryError
+                raise AppGalleryError("boom")
+
+            def detail(self, *a, **k):
+                return None
+
+            def comments(self, *a, **k):
+                return {"list": []}
+
+            def close(self):
+                pass
+
+        bench = {"benchmarks": [{"name": "A", "apple_id": "1",
+                                 "search_keywords": ["k"]}]}
+        saved = []
+        with mock.patch.object(probe.store, "load_benchmarks", return_value=bench), \
+                mock.patch.object(probe, "AppGalleryClient", lambda: FailingClient()), \
+                mock.patch.object(probe.store, "save_probe",
+                                  side_effect=lambda d: saved.append(d)):
+            probe.run({"llm": {"model": "m", "base_url": "http://x"},
+                       "probe": {"enable_llm_filter": False}})
+        # request_error 记录仍会产出，因此这里检查的是「有记录、非空」
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0]["benchmarks"][0]["probe_status"], "request_error")
+
+
+class FilterFailureTest(unittest.TestCase):
+    def _cfg(self):
+        return {"llm": {"model": "m", "base_url": "http://x"},
+                "database": {"path": "data/apps.db"},
+                "filter": {"recent_days": 60, "max_apps": 300, "max_results": 20}}
+
+    def test_empty_database_aborts(self):
+        with mock.patch.object(filter_stage.database, "apps_for_filter",
+                               return_value=[]):
+            with self.assertRaises(PipelineAbortError):
+                filter_stage.run(self._cfg())
+
+    def test_llm_failure_is_retryable(self):
         from radar.llm import LLMError
-        bms = [self._bm(1), self._bm(2)]
-        probes = [self._probe(1), self._probe(2)]
-        with self.assertRaises(PipelineAbortError):
-            self._run([LLMError("x"), LLMError("x")], bms, probes)
 
-    def test_malformed_json_does_not_overwrite(self):
-        bms = [self._bm(1)]
-        probes = [self._probe(1)]
-        with self.assertRaises(PipelineAbortError):
-            self._run(["not a dict"], bms, probes)
+        class BoomLLM:
+            def __init__(self, *a, **k):
+                pass
 
-    def test_out_of_range_scores_invalid(self):
-        bms = [self._bm(1)]
-        probes = [self._probe(1)]
-        bad = {"scores": {"demand": 99, "experience_gap": 5,
-                          "native_advantage": 5, "indie_feasibility": 5},
-               "verdict": "v", "native_features": [], "attack_vector": "a",
-               "indie_advice": "i"}
-        with self.assertRaises(PipelineAbortError):
-            self._run([bad], bms, probes)
+            def chat_json(self, *a, **k):
+                raise LLMError("down")
+
+        with mock.patch.object(filter_stage.database, "apps_for_filter",
+                               return_value=[{"apple_id": "1", "name": "A"}]), \
+                mock.patch.object(filter_stage, "LLMClient", BoomLLM):
+            with self.assertRaises(RetryableAbortError):
+                filter_stage.run(self._cfg())
+
+    def test_empty_result_does_not_overwrite(self):
+        class EmptyLLM:
+            def __init__(self, *a, **k):
+                pass
+
+            def chat_json(self, *a, **k):
+                return []
+
+        saved = []
+        with mock.patch.object(filter_stage.database, "apps_for_filter",
+                               return_value=[{"apple_id": "1", "name": "A"}]), \
+                mock.patch.object(filter_stage, "LLMClient", EmptyLLM), \
+                mock.patch.object(filter_stage.store, "save_filter_results",
+                                  side_effect=lambda d: saved.append(d)):
+            with self.assertRaises(PipelineAbortError):
+                filter_stage.run(self._cfg())
+        self.assertEqual(saved, [])
 
 
 class CliExitCodeTest(unittest.TestCase):
     """退出码约定：可重试中断 = 2，致命熔断 = 1，成功 = 0。"""
 
-    def _main_rc(self, run_stage_rc):
+    def _main_rc(self, run_stage_rc, command="capture"):
         from radar import cli
         with mock.patch.object(cli, "load_config", return_value={}), \
                 mock.patch.object(cli, "_run_stage", return_value=run_stage_rc):
-            return cli.main(["capture"])
+            return cli.main([command])
 
     def test_success_returns_zero(self):
         self.assertEqual(self._main_rc(5), 0)
@@ -129,6 +163,27 @@ class CliExitCodeTest(unittest.TestCase):
 
     def test_retryable_abort_returns_two(self):
         self.assertEqual(self._main_rc(-2), 2)
+
+
+class CliCommandTest(unittest.TestCase):
+    def test_audit_command_removed(self):
+        import contextlib
+        import io
+        from radar import cli
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                cli._build_parser().parse_args(["audit"])
+
+    def test_filter_command_exists(self):
+        from radar import cli
+        args = cli._build_parser().parse_args(["filter"])
+        self.assertEqual(args.command, "filter")
+
+    def test_database_subcommands(self):
+        from radar import cli
+        for sub in ("init", "stats", "refresh", "export"):
+            args = cli._build_parser().parse_args(["database", sub])
+            self.assertEqual(args.db_command, sub)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""流水线子包: capture / probe / audit 各阶段的编排逻辑。"""
+"""流水线子包: capture / probe / filter 各阶段的编排逻辑。"""
 
 
 # 退出码约定（CLI 与 WebUI 共享的单一来源，禁止各处重复定义）

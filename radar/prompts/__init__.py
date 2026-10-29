@@ -121,94 +121,63 @@ _PROBE_PAIN_USER = """以下是从华为应用市场抓取的真实低分用户�
 
 只输出 JSON 对象本身；pain_points 没有内容时必须为空数组。"""
 
-_AUDIT_SYSTEM = """你是“鸿蒙机会雷达”的保守型机会审计员，负责把 iOS 标杆、华为应用市场供给和真实差评转换为可复核的决策分数。你的产出是“待人工定夺的筛选结果”，不是开发承诺或市场预测。
+_USER_FILTER_SYSTEM = """你是独立开发者的应用机会筛选助理。你的任务是通读用户的应用数据库，按用户写明的标准挑出真正值得做的方向，并说明理由。
 
-打分基本原则（严格执行）:
-- **完全基于输入的原始数据打分**，禁止虚构用户规模、收入、评分趋势、竞品功能、系统 API 可用性或开发成本。
-- 事实、合理推断、未知必须分开；输入没有证据时按中低分处理，并在 verdict/indie_advice 中明确“证据不足”。
-- 所有分数在 0~10 之间，保留一位小数。
-- 综合得分 = Demand×0.25 + ExperienceGap×0.30 + NativeAdvantage×0.25 + IndieFeasibility×0.20
-- overall 必须由四个分数按上述公式计算，不能凭主观印象覆盖公式结果。
+事实纪律（严格执行）：
+- 只能使用输入数据库中的事实：应用名、JTBD、入选理由、榜单来源、竞品数量与评分、差评痛点原文。
+- 禁止虚构下载量、收入、评分趋势、用户规模、功能细节或鸿蒙平台能力；未知信息不得当作不存在。
+- 「生态空白」只代表最近一次检索未发现同类竞品，属于待验证假设，不得表述为全市场结论。
+- attack_vector 必须对应输入中真实出现的差评痛点或检索空白；没有证据时写「待验证」。
+- 不得因为应用没被 probe 过就判定它没有机会，只能标注「尚未验证供给」。
 
-证据等级与状态纪律：
-- 输入中的 probe_status / evidence_grade / query_stats 是检索证据的权威描述。
-- request_error、llm_filter_failed、no_search_results 均**不是**确认空白；这些状态下 experience_gap 不得当作生态空白给高分。
-- 证据等级 D 时 experience_gap 上限 4.0；C 时上限 7.0；代码层会强制封顶，不要试图绕过。
+输出纪律：
+- 只输出合法 JSON 数组，不要 Markdown、解释、注释或尾随逗号。
+- 数组元素必须包含 name、apple_id、jtbd、why_pick、attack_vector、native_features、competitors_summary 七个字段。
+- 按你判断的潜力从高到低排序，数量不超过用户消息中的上限。
+- 没有符合条件的应用时返回空数组。"""
 
-C 级空白纪律（重点，防止把“没搜到”当成高潜机会）：
-- C 级空白只能说明“本次检索尚未发现有效同类”，不能证明需求成立，也不能证明全市场不存在同类。
-- C 级空白且没有输入中的明确系统能力证据时，native_advantage 默认取 4~6，不得给到 7 以上。
-- C 级空白且没有清晰的产品边界证据时，indie_feasibility 默认取 4~6，不得给到 7 以上。
-- 只有输入中存在实时状态、桌面操作、语音意图或端侧处理的明确闭环时，native_advantage 才可达到 7；仅凭“理论上能用实况窗/卡片/端侧 AI”不算证据。
-- 只有产品边界简单且输入事实支持时，indie_feasibility 才可达到 7。
-- 一个 C 级空白条目不得同时在多个维度拿到 7 分以上；证据不足时应主动压低，而不是靠维度叠加越过门槛。
+_USER_FILTER = """你是我的个人应用机会筛选助理。
 
-四维定义:
-1. **Demand（需求验证分）**:
-    - 只能依据 JTBD 的场景清晰度和输入中可观察的榜单信号；榜单名次不是用户规模证明。证据不足时取 4~6。
-    - 非常小众或任务含糊时降低，不得因“听起来有用”给高分。
-2. **Experience Gap（体验/供给落差）**:
-    - 生态空白（is_blank=true）且检索证据充分: 给 8~10 分；“空白”只说明本次检索未找到有效同类，不等于全市场绝对不存在。
-    - 有竞品且输入明确显示低分或重复差评: 给 6~8 分；只有少量差评或缺少评分证据时不得上调。
-   - 竞品体验尚可: 给 3~5 分。
-   - 竞品成熟度高: 给 1~3 分。
-3. **Native Advantage（鸿蒙独占特权契合度）**:
-    - 只评估输入场景与下列能力的结构性匹配，不得声称某 API 已经可用或保证审核通过。以下特性可作为候选方向:
-     - 实况窗/动态岛胶囊（实时状态展示: 计时/播放/进度）
-     - 桌面万能卡片（即用即走，免开 App）
-     - 小艺意图框架 / 语音直达
-     - 端侧 AI / 离线微模型
-    - 有明确实时状态/桌面操作/语音意图/端侧处理闭环才可给 7~10；仅能做普通界面时给 1~3；证据不足取 4~6。
-4. **Indie Feasibility（独立开发可行性）**:
-    - 只能根据 JTBD 和输入中可见的产品边界评估；不能凭经验断言“必然两周完成”。纯端侧、状态简单、无外部服务才可偏高。
-    - 需要账户、同步、复杂内容、持续数据源或未证实的系统能力时降分；信息不足取 4~6。
+我的目标：找到适合独立开发者在鸿蒙生态做的小而美产品方向。
 
-输出内容要求：native_features 只列 0~3 个与场景直接相关的候选能力；没有可靠匹配时输出空数组。attack_vector 必须对应输入中的差评或检索空白；没有对应证据时写“待验证”，不要发明痛点。
+筛选标准：
+1. 单一场景，边界清晰，不是平台型产品
+2. 有真实需求验证（Apple 榜单出现 或 华为竞品有差评）
+3. 适合独立开发者（2-4 周 MVP，无需复杂后端或内容运营）
+4. 能用鸿蒙原生能力加分（实况窗/卡片/小艺/端侧 AI）
 
-评论证据纪律：
-- 竞品评论样本量很小、缺失或抓取失败（review_evidence 为 insufficient/missing/request_error）时，视为“未知”，不得据此判断用户没有痛点，也不得给 experience_gap 高分。
-- 只有输入中明确出现重复差评或确认空白时，才可把 attack_vector 写成具体切入点；否则一律写“待验证”。
+优先类型：
+- 工具类（生产力、效率、创作辅助）
+- 生活方式（健康、习惯养成、个人管理）
+- 摄影/音频（滤镜、后期、播客工具）
 
-必须只输出 JSON，不要任何额外文字解释。"""
+排除：
+- 游戏、社交、电商、金融、新闻资讯
+- 大厂全家桶、需要 UGC 运营的产品
+- 需要复杂后端服务的产品
 
-_AUDIT_USER = """请对以下场景进行四维机会审计。以下资料是唯一证据；括号中的“无差评数据”或空白字段代表未知，不代表用户没有问题。输出应便于人工复核。
+输入数据：
+以下是我的应用数据库（Apple 应用信息 + 华为竞品调研）：
 
---- iOS 标杆基础信息 ---
-应用名称: {benchmark_name}
-开发者: {artist}
-JTBD（用户底层任务）: {jtbd}
-入选理由: {pick_reason}
+{database_json}
 
---- 鸿蒙市场供给现状 ---
-探测状态: {probe_status}
-证据等级: {evidence_grade}
-空白置信度: {blank_confidence}
-检索统计(请求/成功/失败/非空): {query_stats}
-检索错误: {search_errors}
-是否生态空白: {is_blank}
-竞品数量: {competitor_count}
-{competitor_details}
+输出要求：
+按你认为最有潜力的顺序（综合考虑：需求验证、开发可行性、竞争态势、原生能力契合度），返回最多 {max_results} 个机会。
 
-{recent_bad_reviews}
+JSON 格式：
+[
+  {{
+    "name": "应用名",
+    "apple_id": "Apple ID",
+    "jtbd": "用户任务",
+    "why_pick": "为什么适合我（2-3句话，说明需求验证 + 开发可行性 + 原生能力）",
+    "attack_vector": "主要切入点（生态空白 或 竞品具体痛点）",
+    "native_features": ["推荐的鸿蒙能力1", "推荐的鸿蒙能力2"],
+    "competitors_summary": "华为竞品概况（数量/评分/主要痛点，1句话）"
+  }}
+]
 
-请按以下 JSON Schema 输出审计结论（只输出 JSON 对象，不要 Markdown 围栏）。四项分数均为 0~10 的一位小数，overall 必须严格按 `demand*0.25 + experience_gap*0.30 + native_advantage*0.25 + indie_feasibility*0.20` 计算并四舍五入到一位小数:
-{{
-  "scores": {{
-    "demand": <0-10 浮点数>,
-    "experience_gap": <0-10 浮点数>,
-    "native_advantage": <0-10 浮点数>,
-    "indie_feasibility": <0-10 浮点数>,
-    "overall": <由权重计算的综合得分>
-  }},
-  "verdict": "<一句话定性判断，说明主要证据、最大不确定性或是否值得进入人工验证>",
-  "native_features": [
-    "<推荐的鸿蒙原生落地功能点 1，如: 实况窗显示倒计时进度>",
-    "<推荐的鸿蒙原生落地功能点 2>"
-  ],
-  "attack_vector": "<突破切入点：必须对应输入中的差评/供给空白；证据不足写待验证>",
-  "indie_advice": "<针对个人开发者的 MVP 范围、验证动作和风险；不得承诺两周必然完成>"
-}}"""
-
+只输出 JSON 数组，不要解释。"""
 
 # 有序模板清单：name → spec（label 供 UI 展示，placeholders 供占位符校验）
 PROMPT_TEMPLATES: dict[str, dict] = {
@@ -224,12 +193,10 @@ PROMPT_TEMPLATES: dict[str, dict] = {
                                _PROBE_PAIN_SYSTEM),
     "probe_pain_user": _spec("差评痛点提炼 · User", "M2 probe", "user", _PROBE_PAIN_USER,
                              ["reviews_json"]),
-    "audit_system": _spec("四维机会审计 · System", "M3 audit", "system", _AUDIT_SYSTEM),
-    "audit_user": _spec("四维机会审计 · User", "M3 audit", "user", _AUDIT_USER,
-                        ["benchmark_name", "artist", "jtbd", "pick_reason", "is_blank",
-                         "competitor_count", "competitor_details", "recent_bad_reviews",
-                         "probe_status", "evidence_grade", "query_stats", "search_errors",
-                         "blank_confidence"]),
+    "user_filter_system": _spec("机会筛选 · System", "AI filter", "system",
+                                _USER_FILTER_SYSTEM),
+    "user_filter": _spec("机会筛选 · User", "AI filter", "user", _USER_FILTER,
+                         ["database_json", "max_results"]),
 }
 
 # 真实占位符：单花括号 {name}；`{{`/`}}` 是 .format() 的字面量转义，不算占位符
@@ -349,8 +316,8 @@ PROBE_FILTER_SYSTEM = get_prompt("probe_filter_system")
 PROBE_FILTER_USER = get_prompt("probe_filter_user")
 PROBE_PAIN_SYSTEM = get_prompt("probe_pain_system")
 PROBE_PAIN_USER = get_prompt("probe_pain_user")
-AUDIT_SYSTEM = get_prompt("audit_system")
-AUDIT_USER = get_prompt("audit_user")
+USER_FILTER_SYSTEM = get_prompt("user_filter_system")
+USER_FILTER_USER = get_prompt("user_filter")
 
 
 def snapshot() -> dict[str, str]:

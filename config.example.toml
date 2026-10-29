@@ -7,7 +7,7 @@
 # OpenAI 兼容接口（本地 vLLM / Ollama / 商用中转均可无缝切换）
 base_url = "http://localhost:8000/v1"   # 本地 vLLM 默认地址
 api_key  = "EMPTY"                      # 本地部署随便填，商用中转填真实 key
-model    = "qwen2.5-coder-32b"          # 打样用本地模型，出看板前换商用精修
+model    = "qwen2.5-coder-32b"          # 打样用本地模型，出结果前换商用精修
 timeout  = 120                          # 秒，本地大模型响应偏慢，给足余量
 
 [capture]
@@ -16,12 +16,27 @@ regions = ["cn", "us"]              # 拉哪些地区的榜单
 charts  = ["top-free", "top-paid"]  # 拉哪些榜单类型
 feed_limit = 100                     # 每个榜单拉取条数（上限 200）
 max_benchmarks = 20                  # LLM 精选后保留的标杆数量上限
+llm_input_limit = 200                # 送入 LLM 的应用条数上限
+rss_retries = 3                      # RSS 拉取重试次数
 
 [probe]
-# ---- 鸿蒙供给探测（M2，预留）----
+# ---- 鸿蒙供给探测（M2）----
 max_comments_per_app = 50            # 每个竞品最多抓多少条评论
 bad_rating_threshold = 3             # rating <= 该值视为中差评
+max_competitors = 3                  # 每个标杆最多保留几个真实竞品
+max_keywords_per_benchmark = 4       # 每个标杆最多用几个关键词检索
+comment_pages = 4                    # 每个竞品最多抓几页评论
+filter_candidates_limit = 8          # 送 LLM 语义判定的候选上限
+enable_llm_filter = true             # 关闭则退化为按下载量/评分排序
 
-[audit]
-# ---- AI 审计打分（M3，预留）----
-min_score = 6.0                       # 四维总分低于此值的机会直接过滤
+[database]
+# ---- 本地增量数据库（核心数据资产）----
+path = "data/apps.db"                # SQLite 路径（相对项目根目录）
+refresh_threshold_days = 30          # 超过 N 天未 probe 标记为「待刷新」
+auto_clean_days = 0                  # 自动清理 N 天未出现的应用（0=禁用）
+
+[filter]
+# ---- AI 事后筛选（按需调用，不做预先打分）----
+recent_days = 60                     # 只把最近 N 天出现过的应用喂给 AI
+max_apps = 300                       # 单次筛选送入 LLM 的应用上限
+max_results = 20                     # AI 最多返回多少个候选机会

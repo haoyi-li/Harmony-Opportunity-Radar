@@ -3,7 +3,6 @@
 import unittest
 
 from radar.pipeline import probe
-from radar.pipeline import audit
 from radar.sources.appgallery import AppGalleryError
 
 
@@ -208,19 +207,57 @@ class ProbeStatusTest(unittest.TestCase):
                "competitors": [{"review_evidence": "insufficient"}]}
         self.assertEqual(probe._derive_evidence_grade(rec), "B")
 
-    def test_audit_context_exposes_probe_status_and_error(self):
-        probe_record = {
-            "name": "标杆", "blank_signal": False,
-            "probe_status": "request_error",
-            "evidence_grade": "D",
-            "query_stats": {"requested": 2, "succeeded": 0, "failed": 2, "non_empty": 0},
-            "search_errors": [{"keyword": "kw1", "error": "boom"}],
-            "competitors": [],
-        }
-        ctx = audit._build_audit_context(_bm(["kw1"]), probe_record)
-        self.assertEqual(ctx["probe_status"], "request_error")
-        self.assertEqual(ctx["is_blank"], "否（证据不足）")
-        self.assertIn("search_errors", ctx)
+    def test_pain_points_extracted_from_bad_reviews(self):
+        cands = [_candidate("pkg.a")]
+        comments = {1: {"count": 2, "total_pages": 1, "list": [
+            {"content": "全是广告", "rating": 1, "time": "t", "version": "v"},
+            {"content": "一点就闪退", "rating": 2, "time": "t", "version": "v"}]}}
+
+        class PagedClient(FakeClient):
+            def comments(self, appid, page_num=1, page_size=25):
+                return comments.get(page_num, {"count": 0, "list": []})
+
+        class PainLLM:
+            def chat_json(self, system, user, **kwargs):
+                if "候选" in user or "package" in user:
+                    return ["pkg.a"]
+                return {"pain_points": [
+                    {"issue": "广告过多", "frequency": "高频", "quote": "全是广告"},
+                    {"issue": "闪退", "frequency": "中频", "quote": "一点就闪退"}]}
+
+        client = PagedClient(results={"kw1": cands})
+        rec = probe._probe_one_benchmark(
+            client, PainLLM(), _bm(["kw1"]), ["kw1"], 50, 3, 8)
+        comp = rec["competitors"][0]
+        self.assertEqual(len(comp["pain_points"]), 2)
+        self.assertEqual(comp["pain_points"][0]["frequency"], "高频")
+
+    def test_pain_extraction_failure_keeps_competitor(self):
+        from radar.llm import LLMError
+        cands = [_candidate("pkg.a")]
+        comments = {1: {"count": 1, "total_pages": 1, "list": [
+            {"content": "广告", "rating": 1, "time": "t", "version": "v"}]}}
+
+        class PagedClient(FakeClient):
+            def comments(self, appid, page_num=1, page_size=25):
+                return comments.get(page_num, {"count": 0, "list": []})
+
+        class FlakyLLM:
+            def __init__(self):
+                self.calls = 0
+
+            def chat_json(self, system, user, **kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    return ["pkg.a"]
+                raise LLMError("pain down")
+
+        client = PagedClient(results={"kw1": cands})
+        rec = probe._probe_one_benchmark(
+            client, FlakyLLM(), _bm(["kw1"]), ["kw1"], 50, 3, 8)
+        comp = rec["competitors"][0]
+        self.assertEqual(comp["pain_points"], [])
+        self.assertEqual(comp["review_evidence"], "insufficient")
 
 
 if __name__ == "__main__":

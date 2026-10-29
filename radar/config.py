@@ -39,8 +39,15 @@ DEFAULTS = {
         "filter_candidates_limit": 8,
         "enable_llm_filter": True,
     },
-    "audit": {
-        "min_score": 6.0,
+    "database": {
+        "path": "data/apps.db",
+        "refresh_threshold_days": 30,
+        "auto_clean_days": 0,
+    },
+    "filter": {
+        "recent_days": 60,
+        "max_apps": 300,
+        "max_results": 20,
     },
 }
 
@@ -115,12 +122,21 @@ def validate_config(cfg: dict) -> list[str]:
     errors += _check_number_range("探测配置：评论抓取页数", prb.get("comment_pages"), 1, 20)
     errors += _check_number_range("探测配置：LLM 候选过滤上限", prb.get("filter_candidates_limit"), 1, 50)
 
-    audit = cfg.get("audit") or {}
-    min_score = audit.get("min_score")
-    if isinstance(min_score, bool) or not isinstance(min_score, (int, float)):
-        errors.append("审计配置：最低分门槛必须是数字。")
-    elif not (0.0 <= float(min_score) <= 10.0):
-        errors.append("审计配置：最低分门槛必须在 0–10 之间。")
+    db = cfg.get("database") or {}
+    if not str(db.get("path", "") or "").strip():
+        errors.append("数据库配置：路径不能为空。")
+    errors += _check_number_range("数据库配置：刷新阈值(天)",
+                                  db.get("refresh_threshold_days"), 1, 3650)
+    errors += _check_number_range("数据库配置：自动清理(天)",
+                                  db.get("auto_clean_days"), 0, 3650)
+
+    flt = cfg.get("filter") or {}
+    errors += _check_number_range("AI 筛选配置：取样时间窗口(天)",
+                                  flt.get("recent_days"), 1, 3650)
+    errors += _check_number_range("AI 筛选配置：取样应用上限",
+                                  flt.get("max_apps"), 1, 2000)
+    errors += _check_number_range("AI 筛选配置：结果上限",
+                                  flt.get("max_results"), 1, 100)
 
     return errors
 
@@ -164,7 +180,8 @@ def save_config(cfg: dict) -> Path:
         ("llm", "LLM 推理配置"),
         ("capture", "榜单捕获配置"),
         ("probe", "华为探测与评价抓取配置"),
-        ("audit", "审计门槛配置"),
+        ("database", "本地增量数据库配置"),
+        ("filter", "AI 事后筛选配置"),
     ]
 
     lines = [

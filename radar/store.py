@@ -3,7 +3,7 @@
 
 M4 版本化改造:
 - 产物按批次写入 `data/runs/<batch_id>/`（batch_id 形如 20260925_120000）。
-- 单步重跑（probe/audit）自动从最近一次成功批次继承上游产物
+- 单步重跑（probe/filter）自动从最近一次成功批次继承上游产物
   （benchmarks.json / probe.json），无需重跑前序阶段。
 - 批次成功时，把产物镜像同步回 `data/` 顶层传统路径，
   保证既有 CLI 工具与第三方调用继续可用（向下兼容）。
@@ -27,21 +27,19 @@ LATEST_POINTER = DATA_DIR / "latest.json"
 STAGE_OUTPUTS = {
     "capture": ["raw_feed.json", "benchmarks.json"],
     "probe": ["probe.json"],
-    "audit": ["audit_results.json", "opportunities.json", "review_queue.json",
-              "report.md"],
+    "filter": ["filter_results.json"],
 }
 
 # 单步重跑需要从上游批次继承的产物
 STAGE_INPUTS = {
     "capture": [],
     "probe": ["benchmarks.json"],
-    "audit": ["benchmarks.json", "probe.json"],
+    "filter": [],  # AI 筛选只读数据库，无需继承 JSON 产物
 }
 
 # 批次内所有可能的产物文件
 ALL_ARTIFACTS = ["raw_feed.json", "benchmarks.json", "probe.json",
-                 "audit_results.json", "opportunities.json", "review_queue.json",
-                 "report.md"]
+                 "filter_results.json"]
 
 # 当前活跃批次（None 表示直接写顶层，兼容旧行为）
 _active_batch = None
@@ -98,9 +96,6 @@ class RunBatch:
     # ---- 读写 ----
     def save_json(self, filename: str, data) -> str:
         return _atomic_write_json(self.dir / filename, data)
-
-    def save_report(self, markdown: str) -> str:
-        return _atomic_write_text(self.dir / "report.md", markdown)
 
     def load_json(self, filename: str, default=None):
         path = self.dir / filename
@@ -219,7 +214,7 @@ def start_run(stage: str, batch_id: str | None = None,
               echo: bool = True) -> RunBatch:
     """开启一个新批次。
 
-    - stage: capture / probe / audit / full
+    - stage: capture / probe / filter / full
     - batch_id: 不传则用当前时间戳
     - base_run_id: 单步重跑时继承上游产物的来源批次；不传则自动取最近成功批次
     - 同时初始化进程内遥测实例，使其把 progress.jsonl 写入本批次目录
@@ -304,11 +299,9 @@ def clear_active() -> None:
 
 
 def summarize_quality(probe_records: list[dict] | None,
-                      audits: list[dict] | None,
                       failed: int = 0, invalid: int = 0) -> dict:
     """汇总批次质量计数，供 meta.json 记录；绝不含任何密钥。"""
     records = probe_records or []
-    audits = audits or []
     return {
         "request_errors": sum(1 for r in records
                               if r.get("probe_status") == "request_error"),
@@ -318,8 +311,6 @@ def summarize_quality(probe_records: list[dict] | None,
                              if r.get("probe_status") == "weak_evidence"),
         "confirmed_empty": sum(1 for r in records
                                if r.get("probe_status") == "confirmed_empty"),
-        "overall_mismatch": sum(1 for a in audits
-                                if a.get("overall_consistent") is False),
         "failed": int(failed),
         "invalid": int(invalid),
     }
@@ -387,46 +378,18 @@ def save_probe(data) -> str:
 
 
 def load_probe(default=None):
-    """读取探测记录（M3 audit 阶段的输入）。"""
+    """读取探测记录（数据库写入与 AI 筛选的输入）。"""
     return load_json("probe.json", default)
 
 
-def save_opportunities(data) -> str:
-    """audit 阶段最终产物：结构化高潜机会清单（仅达标项）。"""
-    return save_json("opportunities.json", data)
+def save_filter_results(data) -> str:
+    """AI 事后筛选产物：从数据库挑出的机会清单。"""
+    return save_json("filter_results.json", data)
 
 
-def load_opportunities(default=None):
-    """读取机会清单。"""
-    return load_json("opportunities.json", default)
-
-
-def save_audit_results(data) -> str:
-    """audit 阶段完整审计产物：全部有效审计结果（含未达标项）。"""
-    return save_json("audit_results.json", data)
-
-
-def load_audit_results(default=None):
-    """读取完整审计结果。"""
-    return load_json("audit_results.json", default)
-
-
-def save_review_queue(data) -> str:
-    """audit 阶段人工复核队列：低证据/请求错误/临界项。"""
-    return save_json("review_queue.json", data)
-
-
-def load_review_queue(default=None):
-    """读取人工复核队列。"""
-    return load_json("review_queue.json", default)
-
-
-def save_report(markdown: str) -> str:
-    """将决策看板 Markdown 内容原子写入 report.md。"""
-    if _active_batch is not None:
-        return _active_batch.save_report(markdown)
-    _ensure_dir()
-    return _atomic_write_text(DATA_DIR / "report.md", markdown)
+def load_filter_results(default=None):
+    """读取最近一次 AI 筛选结果。"""
+    return load_json("filter_results.json", default)
 
 
 # ============================================================
@@ -442,17 +405,6 @@ def load_run_json(batch_id: str, filename: str, default=None):
             return json.load(f)
     except (OSError, ValueError):
         return default
-
-
-def load_run_report(batch_id: str) -> str | None:
-    """读取指定批次的 report.md 文本。"""
-    path = RUNS_DIR / batch_id / "report.md"
-    if not path.exists():
-        return None
-    try:
-        return path.read_text(encoding="utf-8")
-    except OSError:
-        return None
 
 
 def load_traces(batch_id: str) -> list[dict]:

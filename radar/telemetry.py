@@ -8,7 +8,7 @@
     2. 当前批次的 `progress.jsonl`                —— 供落盘回溯/断线补读
 - 所有事件在进程内单例累积，`emit()` 永不抛错（遥测失败绝不能拖垮流水线）。
 
-阶段（stage）取值: capture / probe / audit。
+阶段（stage）取值: capture / probe / filter。
 """
 import json
 import os
@@ -19,16 +19,16 @@ from datetime import datetime, timezone
 # stdout 结构化事件前缀：父进程按此识别，普通日志行不受影响
 EVENT_PREFIX = "__RADAR_EVENT__:"
 
-# 进度百分比锚点：每个阶段在总进度中的起止区间（capture→probe→audit 顺序）
+# 进度百分比锚点：每个阶段在总进度中的起止区间（capture→probe→filter 顺序）
 STAGE_RANGES = {
     "capture": (2.0, 20.0),
     "probe": (20.0, 62.0),
-    "audit": (62.0, 100.0),
+    "filter": (62.0, 100.0),
 }
 STAGE_LABELS = {
     "capture": "榜单捕获",
     "probe": "供给探测",
-    "audit": "四维审计",
+    "filter": "AI 筛选",
 }
 
 _lock = threading.Lock()

@@ -14,17 +14,23 @@
 import json
 import time
 
-from radar import store, telemetry
+from radar import database, store, telemetry
 from radar.config import load_config
 from radar.llm import LLMClient, LLMError
 from radar.pipeline import PipelineAbortError
-from radar.prompts import PROBE_FILTER_SYSTEM, PROBE_FILTER_USER
+from radar.prompts import (PROBE_FILTER_SYSTEM, PROBE_FILTER_USER,
+                           PROBE_PAIN_SYSTEM, PROBE_PAIN_USER)
 from radar.sources.appgallery import AppGalleryClient, AppGalleryError
 
 STAGE = "probe"
 
 
-def run(cfg: dict | None = None) -> int:
+def run(cfg: dict | None = None, apple_ids: list[str] | None = None) -> int:
+    """执行供给探测。
+
+    apple_ids 非空时只探测这些应用（数据库「刷新待更新」走这条路：
+    不重新 capture，只对老应用重新 probe）。
+    """
     if cfg is None:
         cfg = load_config()
 
@@ -42,11 +48,18 @@ def run(cfg: dict | None = None) -> int:
     comment_pages = probe_cfg.get("comment_pages", 4)
 
     benchmarks_list = benchmarks.get("benchmarks", [])
+    if apple_ids:
+        benchmarks_list = _benchmarks_for_refresh(cfg, benchmarks_list, apple_ids)
+        if not benchmarks_list:
+            raise PipelineAbortError(
+                "指定刷新的应用既不在 benchmarks.json 也不在数据库中，请先运行 capture。")
     total = len(benchmarks_list)
     print(f"[M2 probe] 开始探测 {total} 个标杆的鸿蒙竞品…")
     print(f"          配置: LLM过滤={'开启' if enable_llm_filter else '关闭'}, "
           f"候选上限={filter_limit}, 差评阈值≤{bad_threshold}, 评论上限={max_comments}/app")
-    telemetry.current() and telemetry.current().stage_start(STAGE, total)
+    tel = telemetry.current()
+    if tel is not None:
+        tel.stage_start(STAGE, total)
 
     llm = LLMClient(cfg["llm"], stage=STAGE) if enable_llm_filter else None
     results = []
@@ -93,22 +106,141 @@ def run(cfg: dict | None = None) -> int:
             "probe 产出为空，触发熔断：已保留历史 data/probe.json 不被覆盖。"
         )
 
+    probed_at = store._now()
+    # 局部刷新（只重探部分应用）时，把本轮结果合并进既有 probe.json，
+    # 避免用子集覆盖掉其它应用的有效探测记录。
+    merged = _merge_with_existing(results) if apple_ids else results
     store.save_probe({
-        "probed_at": store._now(),
+        "probed_at": probed_at,
         "model": cfg.get("llm", {}).get("model", ""),
-        "count": len(results),
-        "benchmarks": results,
+        "count": len(merged),
+        "benchmarks": merged,
     })
+
+    # ---- 批次质量统计写入 meta（不含任何密钥）----
+    batch = store.active_batch()
+    if batch is not None:
+        batch.meta["quality"] = store.summarize_quality(results)
+        batch._write_meta()
+
+    # ---- 写入本地增量数据库（失败不影响 JSON 产物）----
+    db_ok = _persist_to_database(cfg, results, probed_at)
 
     success = sum(1 for r in results if r["competitor_count"] > 0)
     blank = sum(1 for r in results if r.get("blank_signal"))
     print(f"\n=== probe 完成: {success}/{total} 有竞品, {blank} 空白信号 ===")
     print(f"结果已保存到 probe.json")
-    print(f"下一步: python -m radar audit（四维打分审计）")
-    if telemetry.current():
-        telemetry.current().stage_done(
-            STAGE, f"{success}/{total} 有竞品, {blank} 空白信号")
+    if db_ok:
+        print(f"已写入本地数据库（{db_ok} 条应用状态更新）")
+    else:
+        print("[warn] 数据库写入失败，JSON 产物仍有效")
+    print("下一步: 在 WebUI「数据库」页浏览/筛选，或在「AI 助手」页按需筛选")
+    if tel is not None:
+        tel.stage_done(STAGE, f"{success}/{total} 有竞品, {blank} 空白信号")
     return len(results)
+
+
+def _persist_to_database(cfg: dict, results: list[dict], probed_at: str) -> int:
+    """把本轮 probe 结果写入 SQLite，返回更新的应用条数；异常一律吞掉。"""
+    updated = 0
+    try:
+        db_path = database.resolve_db_path(cfg)
+        database.init_db(db_path)
+        for record in results:
+            if not str(record.get("apple_id", "") or "").strip():
+                continue
+            try:
+                database.save_probe_record(record, probed_at, db_path=db_path)
+                updated += 1
+            except Exception as e:
+                print(f"      [warn] 数据库写入失败（{record.get('name', '?')}）: {e}")
+    except Exception as e:
+        print(f"      [warn] 数据库不可用: {e}")
+        return 0
+    return updated
+
+
+def _attach_pain_points(llm: LLMClient, record: dict, benchmark_name: str) -> None:
+    """对竞品的差评做 LLM 痛点提炼，结果写入 competitor['pain_points']。
+
+    提炼失败不影响 probe 主流程：该竞品保留空痛点列表，原始差评仍在 JSON 中。
+    """
+    for comp in record.get("competitors", []) or []:
+        comp.setdefault("pain_points", [])
+        bad = comp.get("bad_reviews") or []
+        if not bad:
+            continue
+        slim = [{"content": str(r.get("content", ""))[:200],
+                 "rating": r.get("rating")} for r in bad if r.get("content")]
+        if not slim:
+            continue
+        try:
+            parsed = llm.chat_json(
+                PROBE_PAIN_SYSTEM,
+                PROBE_PAIN_USER.format(
+                    reviews_json=json.dumps(slim, ensure_ascii=False, indent=2)),
+                temperature=0.1, stage=STAGE,
+                target=f"{benchmark_name}/{comp.get('name', '')}",
+            )
+        except LLMError:
+            continue
+        pains = parsed.get("pain_points") if isinstance(parsed, dict) else None
+        if isinstance(pains, list):
+            comp["pain_points"] = [
+                {"issue": str(p.get("issue", "")).strip(),
+                 "frequency": str(p.get("frequency", "")).strip(),
+                 "quote": str(p.get("quote", "")).strip()}
+                for p in pains if isinstance(p, dict) and str(p.get("issue", "")).strip()
+            ]
+
+
+def _merge_with_existing(results: list[dict]) -> list[dict]:
+    """把局部刷新结果合并进既有 probe.json（按 apple_id / name 覆盖）。"""
+    existing = store.load_probe() or {}
+    merged: dict[str, dict] = {}
+    for rec in existing.get("benchmarks", []) or []:
+        key = str(rec.get("apple_id") or rec.get("name") or "")
+        if key:
+            merged[key] = rec
+    for rec in results:
+        key = str(rec.get("apple_id") or rec.get("name") or "")
+        if key:
+            merged[key] = rec
+    return list(merged.values())
+
+
+def _benchmarks_for_refresh(cfg: dict, benchmarks_list: list[dict],
+                            apple_ids: list[str]) -> list[dict]:
+    """构造「只刷新老应用」的输入：优先取 benchmarks.json，缺失时回退数据库记录。
+
+    数据库里可能存有早已跌出榜单的应用，它们不在当次 benchmarks.json 中，
+    但仍可用库里保存的 JTBD / 检索关键词重新 probe。
+    """
+    wanted = [str(a).strip() for a in apple_ids if str(a or "").strip()]
+    by_id = {str(bm.get("apple_id", "")): bm for bm in benchmarks_list
+             if bm.get("apple_id")}
+    missing = [aid for aid in wanted if aid not in by_id]
+    if missing:
+        try:
+            db_path = database.resolve_db_path(cfg)
+            database.init_db(db_path)
+            for aid in missing:
+                detail = database.get_app_detail(aid, db_path=db_path)
+                if not detail:
+                    continue
+                by_id[aid] = {
+                    "name": detail.get("name", ""),
+                    "artist": detail.get("artist", ""),
+                    "apple_id": aid,
+                    "jtbd": detail.get("jtbd", ""),
+                    "search_keywords": detail.get("search_keywords") or [],
+                    "pick_reason": detail.get("pick_reason", ""),
+                    "url": detail.get("url", ""),
+                    "source_charts": detail.get("source_charts", ""),
+                }
+        except Exception as e:
+            print(f"      [warn] 读取数据库失败，仅刷新榜单内应用: {e}")
+    return [by_id[aid] for aid in wanted if aid in by_id]
 
 
 def _safe_rating(val) -> float:
@@ -360,7 +492,11 @@ def _probe_one_benchmark(
             "comment_stats": comment_stats,
             "review_evidence": comment_status,
             "rating_distribution": comment_stats["rating_distribution"],
+            "pain_points": [],
         }
+        if llm and bad_reviews:
+            competitor["pain_points"] = _extract_pain_points(
+                llm, bad_reviews, f"{name}/{competitor['name']}")
         competitors.append(competitor)
 
     has_meaningful = any(
@@ -375,6 +511,43 @@ def _probe_one_benchmark(
         query_stats=query_stats, search_errors=search_errors,
         candidate_pool_size=len(seen_pkg), candidates_considered=len(candidates),
         llm_filter_status=filter_status)
+
+
+def _extract_pain_points(llm: LLMClient, bad_reviews: list[dict],
+                         target: str) -> list[dict]:
+    """把差评原文交给 LLM 提炼为结构化痛点。
+
+    失败时返回空列表，不影响 probe 主流程；原始差评仍在 JSON 中保留。
+    """
+    slim = [{"content": str(r.get("content", ""))[:200], "rating": r.get("rating")}
+            for r in bad_reviews if r.get("content")]
+    if not slim:
+        return []
+    try:
+        parsed = llm.chat_json(
+            PROBE_PAIN_SYSTEM,
+            PROBE_PAIN_USER.format(
+                reviews_json=json.dumps(slim, ensure_ascii=False, indent=2)),
+            temperature=0.1, stage=STAGE, target=target,
+        )
+    except LLMError:
+        return []
+    pains = parsed.get("pain_points") if isinstance(parsed, dict) else None
+    if not isinstance(pains, list):
+        return []
+    cleaned = []
+    for p in pains:
+        if not isinstance(p, dict):
+            continue
+        issue = str(p.get("issue", "") or "").strip()
+        if not issue:
+            continue
+        cleaned.append({
+            "issue": issue,
+            "frequency": str(p.get("frequency", "") or "").strip(),
+            "quote": str(p.get("quote", "") or "").strip(),
+        })
+    return cleaned
 
 
 def _collect_comments(client, appid: str, comment_pages: int,

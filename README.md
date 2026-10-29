@@ -1,30 +1,33 @@
 # 纯血鸿蒙机会雷达 (Harmony Opportunity Radar)
 
-以 Apple App Store 榜单为入口，寻找「Apple 已验证、鸿蒙侧可能存在供给落差」的机会假设，并用四维审计打分输出决策看板。
+以 Apple App Store 榜单为入口，把「Apple 已验证、鸿蒙侧可能存在供给落差」的应用逐条累积进本地数据库，再用按需 AI 筛选挑出值得做的方向。
 
-> 定位说明：本工具产出的是**待验证的机会假设**，而非已证实的全市场结论。所有打分基于输入事实，不虚构下载量、收入、评分趋势或平台能力。
+> 定位说明：本工具产出的是**待验证的机会假设**，而非已证实的全市场结论。所有判断基于抓取到的事实，不虚构下载量、收入、评分趋势或平台能力。
+
+## 设计原则
+
+- **不做预先打分**：抓到的应用全部保留，不设分数门槛，不把「有机会的」提前过滤掉。
+- **只增不减的本地资产**：每次抓取都写入 SQLite，老应用刷新时间戳，竞品与差评按轮次追加，可以看到趋势。
+- **按需 AI 筛选**：想看机会时才调用 LLM，用你自己维护的提示词从全量数据里挑。
 
 ## 功能概览
 
-流水线分为三个阶段，逐级依赖上游产物：
-
 | 阶段 | 命令 | 作用 |
 |---|---|---|
-| capture | `python -m radar capture` | 拉取 Apple 榜单 → LLM 精选标杆 → 提炼 JTBD |
-| probe | `python -m radar probe` | 检索鸿蒙同类供给，两阶段过滤竞品并抓取中差评 |
-| audit | `python -m radar audit` | 四维打分审计，筛选 ≥6.0 分的高潜机会 |
+| capture | `python -m radar capture` | 拉取 Apple 榜单 → LLM 精选标杆 → 提炼 JTBD → 写入数据库 |
+| probe | `python -m radar probe` | 检索鸿蒙同类供给，两阶段过滤竞品，抓取差评并提炼痛点 → 写入数据库 |
+| filter | `python -m radar filter` | 把数据库全量事实交给 AI，按 `prompts/user_filter.txt` 挑机会 |
 
 每个阶段都会在 `data/runs/<batch_id>/` 下新建批次目录，归档中间产物、提示词快照与 LLM traces，互不覆盖。
 
 ## 环境要求
 
-- Python 3.11+（依赖标准库 `tomllib`）
+- Python 3.11+（依赖标准库 `tomllib` 与 `sqlite3`）
 - Windows 环境可使用 `run.ps1` / `run.bat`；其他平台可直接使用 `python -m radar`
 
 ## 安装
 
 ```powershell
-# 安装依赖
 .\run.ps1 install
 # 或
 python -m pip install -r requirements.txt
@@ -43,20 +46,21 @@ Copy-Item config.example.toml config.toml
 关键配置项：
 
 - `[llm] base_url / api_key / model / timeout`
-- `[capture] regions / charts / feed_limit / max_benchmarks`
-- `[probe] max_comments_per_app / bad_rating_threshold`
-- `[audit] min_score`（默认 6.0）
+- `[capture] regions / charts / feed_limit / max_benchmarks / llm_input_limit`
+- `[probe] max_comments_per_app / bad_rating_threshold / max_competitors`
+- `[database] path / refresh_threshold_days / auto_clean_days`
+- `[filter] recent_days / max_apps / max_results`
 
 ## 运行
 
 ```powershell
 .\run.ps1              # 交互菜单
-.\run.ps1 gui          # 启动 Streamlit 情报看板
-.\run.ps1 full         # 全量流水线 capture -> probe -> audit
+.\run.ps1 gui          # 启动 Streamlit 数据看板
+.\run.ps1 full         # 全量流水线 capture -> probe
 .\run.ps1 capture      # 仅捕获
 .\run.ps1 probe        # 仅探测
-.\run.ps1 audit        # 仅审计
-.\run.ps1 check        # 环境自检
+.\run.ps1 filter       # AI 事后筛选
+.\run.ps1 db-stats     # 数据库统计
 ```
 
 也可直接使用 CLI：
@@ -64,19 +68,54 @@ Copy-Item config.example.toml config.toml
 ```powershell
 python -m radar capture --batch-id 20260101_120000
 python -m radar probe   --batch-id 20260101_120000
-python -m radar audit   --batch-id 20260101_120000
+python -m radar probe   --only-stale            # 只刷新超期未探测的应用
+python -m radar probe   --apple-ids 123456,789  # 只刷新指定应用
+python -m radar filter
 ```
 
 单步执行默认继承最近一次成功批次的上游产物，也可用 `--base-run-id` 指定来源批次。
 
+数据库子命令：
+
+```powershell
+python -m radar database init      # 初始化（幂等）
+python -m radar database stats     # 统计概览
+python -m radar database refresh   # 列出待刷新应用
+python -m radar database export    # 导出 CSV
+python -m radar database clean --days 90
+```
+
 ## 数据与产物
 
-所有中间产物与终产物均位于 `data/` 下，写入采用临时文件 + `os.replace` 原子替换。`data/` 已被 `.gitignore` 排除。
+所有中间产物位于 `data/` 下，写入采用临时文件 + `os.replace` 原子替换。`data/` 已被 `.gitignore` 排除。
 
+- `data/apps.db`：**SQLite 增量数据库（核心资产）**，三张表 `apps` / `competitors` / `reviews`，WAL 模式
 - `data/runs/<batch_id>/`：批次隔离目录
 - `data/runs/<batch_id>/llm_traces.jsonl`：结构化 LLM 调用记录
-- `data/opportunities.json`：机会清单
-- `data/report.md`：决策看板
+- `data/benchmarks.json`、`data/probe.json`：最近一次批次的镜像产物
+- `data/filter_results.json`：最近一次 AI 筛选结果
+
+数据库表结构要点：
+
+| 表 | 内容 |
+|---|---|
+| `apps` | 应用基础信息 + `first_seen` / `last_seen` / `capture_count` / `last_probe_at` / `is_blank` / `needs_refresh` / `is_favorite` |
+| `competitors` | 每轮 probe 的竞品快照（评分、下载、评论证据、`probed_at`），按轮次追加 |
+| `reviews` | LLM 提炼的差评痛点（issue / frequency / quote），关联到竞品 |
+
+## WebUI
+
+`.\run.ps1 gui` 启动后共有五个标签：
+
+1. **数据库**：概览卡片、多条件筛选、应用列表、详情（竞品/痛点/Probe 历史）、刷新与导出
+2. **AI 助手**：编辑筛选提示词 → 执行筛选 → 查看候选机会（可收藏、导出 Markdown）
+3. **流水线**：捕获 / 探测 / AI 筛选按钮、产物状态、结构化 traces 与纯文本日志、配置表单
+4. **历史批次**：回溯任意批次的产物与 LLM 调用
+5. **提示词微调**：逐个编辑 `prompts/*.txt`
+
+## 提示词
+
+提示词模板独立存放于 `prompts/*.txt`，WebUI 可编辑并一键恢复默认。AI 筛选提示词（`prompts/user_filter.txt`）决定从全量数据库里挑什么，建议按当前想做的方向随时调整。
 
 ## 安全与隐私
 
@@ -86,14 +125,16 @@ python -m radar audit   --batch-id 20260101_120000
 ## 项目结构
 
 ```
-app.py                # Streamlit WebUI 情报看板
+app.py                # Streamlit WebUI
 radar/
   cli.py              # CLI 入口
   config.py           # 配置加载与校验
+  database.py         # SQLite 增量数据库
   llm.py              # OpenAI 兼容 LLM 客户端
   store.py            # 批次归档与原子写入
   telemetry.py        # 结构化遥测事件
-  pipeline/           # capture / probe / audit 三阶段
+  viewmodel.py        # 数据库/产物的展示层读模型
+  pipeline/           # capture / probe / filter
   sources/            # apple_rss / appgallery 数据源
   prompts/            # 提示词加载与内建默认模板
 prompts/              # 外置提示词模板（可微调）
@@ -102,4 +143,4 @@ poc/                  # 早期接口探测与验证脚本（非正式入口）
 
 ## 依赖
 
-全流程仅依赖 Python 标准库与 `httpx`、`streamlit`，不引入数据库、MQ 或复杂 ORM。
+仅依赖 Python 标准库（含 `sqlite3`）与 `httpx`、`streamlit`，不引入数据库服务、MQ 或 ORM。

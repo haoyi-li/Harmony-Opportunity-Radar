@@ -1,14 +1,15 @@
 # -*- coding: utf-8 -*-
-"""M4: Streamlit GUI 情报看板与交互控制台。
+"""M5: Streamlit GUI —— 数据库浏览器 + AI 按需筛选 + 流水线控制台。
 
 启动方式:
     python -m streamlit run app.py
     python -m radar gui
 
-设计约束（见计划）:
+设计约束:
 - 后台子进程只向线程安全的 queue.Queue 投递消息，绝不跨线程调用 st.*
 - 主线程 / 片段消费队列，更新日志与运行状态
-- 只读取 data/ 下已有产物，不改动 schema 与原子写入机制
+- 数据库只读渲染，写操作（收藏/刷新）通过显式按钮触发
+- 不做任何预先打分，全部原始数据保留，筛选交给用户与按需 AI
 """
 import html
 import json
@@ -17,12 +18,11 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import datetime
 from pathlib import Path
 
 import streamlit as st
 
-from radar import prompts, store, telemetry
+from radar import database, prompts, store, telemetry, viewmodel
 from radar.config import DEFAULTS, PROJECT_ROOT, load_config, save_config, validate_config
 from radar.pipeline import EXIT_RETRYABLE
 from radar.store import DATA_DIR, RUNS_DIR
@@ -30,7 +30,6 @@ from radar.store import DATA_DIR, RUNS_DIR
 # Windows asyncio ProactorEventLoop 的已知噪音：对端强制断开（如关闭/刷新
 # Streamlit 页面、网络抖动）后，连接收尾时 socket.shutdown() 会抛
 # ConnectionResetError，被默认异常处理器打印成 _call_connection_lost 回调错误。
-# 它不影响采集/探测/审计流水线，这里仅静音这一种异常，其余照常抛出。
 if sys.platform == "win32":
     try:
         from asyncio.proactor_events import _ProactorBasePipeTransport
@@ -54,7 +53,7 @@ st.set_page_config(
 )
 
 # --------------------------------------------------------------------------
-# 设计 token 与全局样式
+# 设计 token 与全局样式（只保留两个信号色：达标=青，生态空白=琥珀）
 # --------------------------------------------------------------------------
 CSS = """
 <style>
@@ -63,7 +62,7 @@ CSS = """
   --bg-0:#05070C; --bg-1:#0A0D12; --surface-1:#0F131C; --surface-2:#141A26;
   --border-1:#1E2735; --border-2:#2A3646;
   --text-1:#E7ECF3; --text-2:#9AA7B8; --text-3:#8A99AC;
-  --cyan:#38BDF8; --green:#6EE7B7; --amber:#E9A568; --gold:#FFD54F; --blue:#7DA2FF;
+  --cyan:#38BDF8; --green:#6EE7B7; --amber:#E9A568; --gold:#FFD54F;
   --danger:#FF8A80; --ok:#6EE7B7;
   --radius:14px; --radius-sm:10px; --ease:cubic-bezier(.22,.61,.36,1);
   --font-display:Georgia,"Times New Roman",serif;
@@ -74,24 +73,16 @@ html{ color-scheme:dark; }
 .block-container{ padding-top:4.4rem; padding-bottom:2.5rem; max-width:1500px; }
 h1,h2,h3,h4{ color:var(--text-1); letter-spacing:.2px; text-wrap:balance; }
 p, li, span, label{ color:var(--text-2); }
-p{ text-wrap:pretty; }
-/* 仅供读屏器：为颜色编码补一段等价文字 */
-.sr{ position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden;
-  clip:rect(0 0 0 0); white-space:nowrap; border:0; }
-
-/* 浏览器原生表面：选区 / 光标 / 滚动条 / 焦点环 —— 最廉价的"手工打造"信号 */
 ::selection{ background:rgba(56,189,248,.30); color:var(--text-1); }
 input, textarea{ caret-color:var(--cyan); }
 ::-webkit-scrollbar{ width:10px; height:10px; }
 ::-webkit-scrollbar-track{ background:var(--bg-1); }
 ::-webkit-scrollbar-thumb{ background:#26303F; border-radius:999px; border:2px solid var(--bg-1); }
-::-webkit-scrollbar-thumb:hover{ background:#33404F; }
 *{ scrollbar-color:#26303F var(--bg-1); scrollbar-width:thin; }
 :focus-visible{ outline:2px solid var(--cyan); outline-offset:2px; border-radius:4px; }
 header[data-testid="stHeader"]{ background:transparent !important; }
 section[data-testid="stSidebar"]{ background:var(--bg-1) !important; border-right:1px solid var(--border-1); }
 
-/* 顶部品牌区：报头式排版 —— 衬线题名 + 等宽数据行，其余全部让位给内容 */
 .brand{ display:flex; align-items:center; gap:14px; flex-wrap:wrap; }
 .brand-mark{ width:38px; height:38px; flex:none; color:var(--cyan); }
 .brand-mark svg{ display:block; width:100%; height:100%; }
@@ -104,7 +95,6 @@ section[data-testid="stSidebar"]{ background:var(--bg-1) !important; border-righ
 .brand-meta .item:last-child{ border-right:none; margin-right:0; padding-right:0; }
 .brand-meta .item b{ color:var(--text-1); font-weight:650; }
 
-/* 状态胶囊 */
 .status{ display:inline-flex; align-items:center; gap:7px; font-size:.78rem; font-weight:600;
   padding:4px 12px; border-radius:999px; border:1px solid var(--border-2); }
 .status .dot{ width:7px; height:7px; border-radius:50%; background:var(--text-3); }
@@ -120,13 +110,10 @@ section[data-testid="stSidebar"]{ background:var(--bg-1) !important; border-righ
 @keyframes pulse{ 0%,100%{opacity:1} 50%{opacity:.3} }
 @media (prefers-reduced-motion:reduce){ *{ animation:none !important; transition:none !important; } }
 
-/* 通用面板 */
 .panel{ background:var(--surface-1); border:1px solid var(--border-1); border-radius:var(--radius);
   padding:16px 18px; margin-bottom:12px; }
 .panel-title{ font-size:.92rem; font-weight:700; color:var(--text-1); margin-bottom:10px; }
 
-/* 运行概览指标条：单一共享表面 + 竖分隔，取代并排卡片。
-   颜色只编码"这份数字有多强"，不按指标轮换色相 —— 琥珀留给生态空白 */
 .statline{ display:grid; grid-template-columns:repeat(auto-fit,minmax(120px,1fr));
   background:var(--surface-1); border:1px solid var(--border-1); border-radius:var(--radius); }
 .stat{ padding:13px 16px; border-left:1px solid var(--border-1); min-width:0; }
@@ -143,55 +130,12 @@ section[data-testid="stSidebar"]{ background:var(--bg-1) !important; border-righ
   .stat:nth-child(-n+2){ border-top:none; }
 }
 
-/* 天梯：维度名只在表头出现一次，并对齐到四列评分条；行内只留数值与形状 */
-.ladder{ border:1px solid var(--border-1); border-radius:var(--radius); overflow:hidden; }
-.ladder-head{ padding:10px 14px; background:var(--surface-2); }
-.lh-cols{ display:grid; grid-template-columns:2.6rem minmax(0,1.6fr) 5.5rem minmax(0,1fr);
-  gap:10px; font-size:.74rem; color:var(--text-3); }
-.lh-dims{ display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:14px;
-  margin-top:10px; font-size:.7rem; color:var(--text-3); }
-.lh-dims span b{ display:inline-block; width:7px; height:7px; border-radius:2px;
-  margin-right:6px; vertical-align:middle; }
-.ladder-row{ padding:12px 14px; border-top:1px solid var(--border-1); background:var(--surface-1);
-  transition:background .18s var(--ease); }
-.ladder-row.blank{ background:linear-gradient(90deg, rgba(233,165,104,.07), transparent 55%); }
-.ladder-row:hover{ background:var(--surface-2); }
-.lr-head{ display:grid; grid-template-columns:2.6rem minmax(0,1.6fr) 5.5rem minmax(0,1fr);
-  gap:10px; align-items:center; }
-.lr-rank{ color:var(--text-3); font-variant-numeric:tabular-nums; font-size:.85rem; }
-.lr-name{ color:var(--text-1); font-weight:650; font-size:.95rem;
-  overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-.lr-verdict{ color:var(--text-3); font-size:.78rem; line-height:1.5; }
-.lr-bars{ display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:14px; margin-top:11px; }
-@media (max-width:900px){
-  .ladder-head{ display:none; }
-  .lr-head{ grid-template-columns:2.2rem minmax(0,1fr) auto; }
-  .lr-verdict{ grid-column:1 / -1; }
-  .lr-bars{ grid-template-columns:repeat(2,minmax(0,1fr)); }
-}
-
-/* 评分条：表头已给出维度名，行内标签仅在窄屏（表头隐藏时）回填 */
-.bar-wrap{ min-width:0; }
-.bar-head{ display:flex; justify-content:space-between; align-items:baseline; gap:8px;
-  font-size:.72rem; margin-bottom:4px; min-height:1.05rem; }
-.bar-label{ color:var(--text-3); }
-.ladder-row .bar-label{ visibility:hidden; }
-@media (max-width:900px){ .ladder-row .bar-label{ visibility:visible; } }
-.bar-val{ color:var(--text-2); font-variant-numeric:tabular-nums; margin-left:auto; }
-.bar-track{ height:6px; border-radius:999px; background:var(--surface-2); overflow:hidden; }
-.bar-fill{ height:100%; border-radius:999px; }
-
-/* 徽章与胶囊：分数用等宽数字对齐比较，胶囊只标记"生态空白"这一个特殊状态 */
-.badge{ display:inline-block; font-weight:700; font-size:.9rem; padding:2px 11px; border-radius:9px;
-  font-family:var(--font-mono); font-variant-numeric:tabular-nums; }
-.badge.high{ color:#05070C; background:var(--green); }
-.badge.mid{ color:#05070C; background:var(--gold); }
-.badge.low{ color:var(--text-2); background:var(--surface-2); border:1px solid var(--border-2); }
 .pill{ display:inline-block; font-size:.68rem; padding:2px 9px; border-radius:999px;
   border:1px solid var(--border-2); color:var(--text-2); }
 .pill-blank{ color:var(--gold); border-color:rgba(255,213,79,.4); background:rgba(255,213,79,.08); }
+.pill-refresh{ color:var(--amber); border-color:rgba(233,165,104,.4); background:rgba(233,165,104,.08); }
+.pill-fav{ color:var(--cyan); border-color:rgba(56,189,248,.4); background:rgba(56,189,248,.08); }
 
-/* 详情 */
 .detail-head{ display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
 .detail-name{ font-family:var(--font-display); font-size:1.34rem; font-weight:700;
   color:var(--text-1); line-height:1.2; }
@@ -211,14 +155,12 @@ section[data-testid="stSidebar"]{ background:var(--bg-1) !important; border-righ
   border-radius:var(--radius-sm); padding:12px 14px; color:var(--text-1); font-size:.9rem;
   line-height:1.6; }
 
-/* 详情/空白卡片容器：st.container(key=...) 渲染为 st-key-* 类，避免手工开合 div */
-.st-key-detail_card, [class*="st-key-gap_card_"]{
+.st-key-detail_card, [class*="st-key-gap_card_"], [class*="st-key-opp_card_"]{
   background:var(--surface-1); border:1px solid var(--border-1); border-radius:var(--radius);
   padding:18px 20px; margin-bottom:14px; }
 [class*="st-key-gap_card_"]{
   background:linear-gradient(90deg, rgba(233,165,104,.06), transparent 40%), var(--surface-1); }
 
-/* 数据产物状态 */
 .artifact{ display:flex; align-items:center; justify-content:space-between; gap:10px;
   padding:9px 12px; border-bottom:1px solid var(--border-1); font-size:.82rem; }
 .artifact:last-child{ border-bottom:none; }
@@ -229,14 +171,12 @@ section[data-testid="stSidebar"]{ background:var(--bg-1) !important; border-righ
 .artifact .state.ok{ color:var(--ok); }
 .artifact .state.bad{ color:var(--danger); }
 
-/* 日志 */
 .logbox{ background:#04060A; border:1px solid var(--border-1); border-radius:var(--radius-sm);
   padding:12px 14px; font-family:var(--font-mono); font-size:.76rem;
   line-height:1.55; color:#B9C6D6; max-height:420px; overflow-y:auto; white-space:pre-wrap;
   word-break:break-word; overscroll-behavior:contain; }
 .logbox.small{ max-height:150px; }
 
-/* 非线性缓动进度条：超平滑弹力缓动 + 流动渐变微光，避免 Streamlit 原生动画的生硬跳变 */
 .prog{ margin-top:12px; }
 .prog-head{ display:flex; justify-content:space-between; align-items:baseline; gap:12px;
   font-size:.8rem; margin-bottom:7px; }
@@ -259,7 +199,6 @@ section[data-testid="stSidebar"]{ background:var(--bg-1) !important; border-righ
   .prog-fill{ transition:none; } .prog-fill::after{ animation:none; }
 }
 
-/* 结构化 LLM Traces 卡片：标注耗时/状态/标杆，点击展开完整 Prompt 与原始响应 */
 .trace{ background:var(--surface-1); border:1px solid var(--border-1);
   border-radius:var(--radius-sm); padding:10px 13px; margin-bottom:8px; }
 .trace-head{ display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
@@ -277,7 +216,6 @@ section[data-testid="stSidebar"]{ background:var(--bg-1) !important; border-righ
   padding:9px 11px; font-family:var(--font-mono); font-size:.73rem; color:#B9C6D6;
   max-height:260px; overflow:auto; white-space:pre-wrap; word-break:break-word; }
 
-/* 提示词编辑器 */
 .prompt-head{ display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:6px; }
 .prompt-name{ color:var(--text-1); font-weight:650; }
 .ph-chip{ font-family:var(--font-mono); font-size:.7rem; color:var(--cyan);
@@ -286,7 +224,6 @@ section[data-testid="stSidebar"]{ background:var(--bg-1) !important; border-righ
 .custom-badge{ font-size:.68rem; color:var(--gold); border:1px solid rgba(255,213,79,.4);
   background:rgba(255,213,79,.08); border-radius:999px; padding:1px 9px; }
 
-/* 空状态：教会用户下一步，而不是"这里什么都没有" */
 .empty{ border:1px dashed var(--border-2); border-radius:var(--radius); padding:26px 22px;
   text-align:center; background:var(--surface-1); }
 .empty .t{ color:var(--text-1); font-weight:650; font-size:.98rem; }
@@ -295,7 +232,6 @@ section[data-testid="stSidebar"]{ background:var(--bg-1) !important; border-righ
   border-radius:8px; padding:5px 11px; color:var(--cyan); font-size:.78rem;
   font-family:var(--font-mono); }
 
-/* 标签页与控件 */
 .stTabs [data-baseweb="tab-list"]{ gap:6px; border-bottom:1px solid var(--border-1); }
 .stTabs [data-baseweb="tab"]{ padding:9px 16px; border-radius:10px 10px 0 0; color:var(--text-2);
   transition:color .18s var(--ease), background .18s var(--ease); }
@@ -304,7 +240,6 @@ section[data-testid="stSidebar"]{ background:var(--bg-1) !important; border-righ
 div[data-testid="stExpander"] details{ border:1px solid var(--border-1) !important; border-radius:var(--radius-sm) !important; }
 hr{ border-color:var(--border-1); }
 
-/* 按钮：统一形状与状态，主按钮用行动色；触屏去掉 300ms 双击缩放延迟 */
 .stButton > button, .stDownloadButton > button, [data-testid="stFormSubmitButton"] > button{
   border-radius:10px; border:1px solid var(--border-2); font-weight:600;
   touch-action:manipulation; -webkit-tap-highlight-color:transparent;
@@ -329,29 +264,19 @@ QUEUE_KEY = "_queue"
 TRACES_KEY = "_traces"
 PROGRESS_KEY = "_progress"
 HISTORY_KEY = "_history_batch"
-PROMPT_DRAFT_KEY = "_prompt_draft"
-MIN_SCORE_KEY = "min_score"
+PROMPT_SYNC_PREFIX = "_prompt_sync_"
 MAX_LOG = 600
 MAX_TRACES = 200
-DIM_META = [
-    ("需求验证", "demand", "#38BDF8", "场景普遍性与刚需度"),
-    ("体验落差", "experience_gap", "#6EE7B7", "鸿蒙供给空白 / 竞品差评空间"),
-    ("原生契合", "native_advantage", "#A78BFA", "实况窗 / 卡片 / 小艺 / 端侧 AI"),
-    ("开发可行", "indie_feasibility", "#94A3B8", "单人端侧开发成本"),
-]
 
 PIPELINE_STEPS = {
-    "full": [("榜单捕获", ["capture"]), ("供给探测", ["probe"]), ("四维审计", ["audit"])],
+    "full": [("榜单捕获", ["capture"]), ("供给探测", ["probe"])],
     "capture": [("榜单捕获", ["capture"])],
     "probe": [("供给探测", ["probe"])],
-    "audit": [("四维审计", ["audit"])],
+    "filter": [("AI 筛选", ["filter"])],
 }
 
-# 步骤级可重试中断的自动重试次数与退避基数（秒）
 STEP_RETRY_ATTEMPTS = 2
 STEP_RETRY_BASE_WAIT = 3.0
-
-# 历史批次下拉的「当前/最新」哨兵值
 LATEST_SENTINEL = "__latest__"
 
 
@@ -390,10 +315,6 @@ def _append_trace(trace: dict):
 # 后台执行（线程安全：只写 queue，不碰 st.*）
 # --------------------------------------------------------------------------
 def _run_step(q: "queue.Queue", prefix: str, args: list, batch_id: str | None):
-    """执行单个阶段子进程，返回 (returncode, batch_id)。
-
-    子进程 stdout 的遥测事件实时投递到 queue；批次号在首次出现时捕获。
-    """
     cmd_args = list(args) + ["--emit-events"]
     if batch_id:
         cmd_args += ["--batch-id", batch_id]
@@ -409,7 +330,7 @@ def _run_step(q: "queue.Queue", prefix: str, args: list, batch_id: str | None):
             errors="replace",
             bufsize=1,
         )
-    except Exception as exc:  # 启动失败：解释器缺失 / 环境异常
+    except Exception as exc:
         q.put(("error", f"命令执行失败，请检查环境: {exc}"))
         return None, batch_id
     try:
@@ -420,7 +341,6 @@ def _run_step(q: "queue.Queue", prefix: str, args: list, batch_id: str | None):
             if event is None:
                 q.put(("log", line.rstrip()))
                 continue
-            # 捕获首个阶段的批次号，供后续阶段复用同一批次目录
             if batch_id is None and event.get("batch_id"):
                 batch_id = event["batch_id"]
             q.put(("event", event))
@@ -429,8 +349,6 @@ def _run_step(q: "queue.Queue", prefix: str, args: list, batch_id: str | None):
             proc.stdout.close()
         except Exception:
             pass
-    # 读到 stdout EOF 后 returncode 仍可能是 None（进程尚未回收），
-    # 必须显式 wait() 拿真实退出码；否则 None != 0 会把成功误判为失败。
     try:
         returncode = proc.wait(timeout=10)
     except subprocess.TimeoutExpired:
@@ -448,18 +366,7 @@ def _run_step(q: "queue.Queue", prefix: str, args: list, batch_id: str | None):
 
 def _worker(q: "queue.Queue", label: str, steps: list, offset: int = 0,
             batch_id: str | None = None):
-    """后台线程：串行执行各阶段子进程，解析其 stdout 遥测事件并投递到 queue。
-
-    事件协议（见 radar/telemetry.py）: 行首 `__RADAR_EVENT__:{json}` 为结构化事件，
-    其余行为普通日志。全量扫描时各阶段共享同一个 batch_id，产物归档到同一批次。
-
-    offset 为续跑时的全局步骤起点（用于显示「步骤 2/3」）；batch_id 续跑时复用。
-
-    失败语义：
-    - 退出码 2（可重试中断）自动重试 STEP_RETRY_ATTEMPTS 次，仍失败则进入
-      「中断」态并上报失败步骤索引，等待用户在 WebUI 修好配置后一键继续。
-    - 其他非零退出码为致命熔断，直接中止。
-    """
+    """后台线程：串行执行各阶段子进程，解析 stdout 遥测事件并投递到 queue。"""
     total = offset + len(steps)
     for i, (step_label, args) in enumerate(steps, offset + 1):
         prefix = f"步骤 {i}/{total} · {step_label}" if total > 1 else step_label
@@ -474,7 +381,6 @@ def _worker(q: "queue.Queue", label: str, steps: list, offset: int = 0,
                 return
             if returncode == 0:
                 break
-            # 可重试中断：退避后自动重试，仍失败则交回用户决定是否继续
             if returncode == EXIT_RETRYABLE and attempt <= STEP_RETRY_ATTEMPTS:
                 wait = STEP_RETRY_BASE_WAIT * attempt
                 q.put(("log", f"↻ {step_label} 可重试中断，{wait:.0f}s 后自动重试"
@@ -494,15 +400,10 @@ def _worker(q: "queue.Queue", label: str, steps: list, offset: int = 0,
 
 
 def _start_run(label: str, key: str, resume_from: int = 0, batch_id: str | None = None,
-               all_steps: list | None = None):
-    """启动一次运行。
-
-    resume_from > 0 表示从失败步骤继续：只跑该步及其之后的步骤，
-    并复用原批次目录（batch_id），上游产物已在其中，无需重新继承。
-    all_steps 用于在续跑时保留完整步骤列表（进度显示为「步骤 2/3」而非「1/2」）。
-    """
-    full_steps = all_steps or PIPELINE_STEPS[key]
-    steps = full_steps[resume_from:]
+               all_steps: list | None = None, steps: list | None = None):
+    """启动一次运行。steps 显式给出时优先（用于「刷新指定应用」等定制命令）。"""
+    full_steps = all_steps or steps or PIPELINE_STEPS[key]
+    run_steps = full_steps[resume_from:]
     q: "queue.Queue" = queue.Queue()
     st.session_state[QUEUE_KEY] = q
     st.session_state[LOG_KEY] = []
@@ -520,27 +421,27 @@ def _start_run(label: str, key: str, resume_from: int = 0, batch_id: str | None 
         "batch_id": batch_id,
         "key": key,
         "steps": [s[0] for s in full_steps],
+        "run_steps": full_steps,
         "failed_step": None,
     }
     verb = f"继续: {label}（从步骤 {resume_from + 1}/{len(full_steps)}）" if resume_from else f"启动: {label}"
     _append_log(verb)
-    threading.Thread(target=_worker, args=(q, label, steps, resume_from, batch_id),
+    threading.Thread(target=_worker, args=(q, label, run_steps, resume_from, batch_id),
                      daemon=True).start()
 
 
 def _resume_run():
-    """从上次中断的步骤继续：复用原批次目录，只跑失败步骤及其后续。"""
     state = st.session_state[RUN_KEY]
     key = state.get("key")
     failed_step = state.get("failed_step")
     if not key or failed_step is None:
         return
+    steps = state.get("run_steps") or PIPELINE_STEPS.get(key)
     _start_run(state.get("label", "继续"), key, resume_from=failed_step,
-               batch_id=state.get("batch_id"), all_steps=PIPELINE_STEPS[key])
+               batch_id=state.get("batch_id"), all_steps=steps)
 
 
 def _handle_event(event: dict):
-    """把一条遥测事件应用到会话状态（进度 / trace / 批次号）。"""
     etype = event.get("type")
     state = st.session_state[RUN_KEY]
     if event.get("batch_id") and not state.get("batch_id"):
@@ -632,15 +533,14 @@ def _status_html(state, live: bool = True) -> str:
         label = f"运行中 · {state.get('label', '')}"
     live_attr = ' role="status" aria-live="polite"' if live else ""
     return (f'<span class="status {status}"{live_attr}>'
-            f'<span class="dot" aria-hidden="true"></span>{html.escape(label)}</span>')
+            f'<span class="dot" aria-hidden="true"></span>{html.escape(str(label))}</span>')
 
 
 # --------------------------------------------------------------------------
-# 数据加载（全部走已有产物，损坏时给出明确错误态）
+# 数据读取（批次产物 + 数据库）
 # --------------------------------------------------------------------------
 @st.cache_data(show_spinner=False)
 def _read_json_cached(path_str: str, mtime_ns: int, size: int):
-    """按 (路径, mtime, size) 缓存的 JSON 读取，避免每次 rerun 重解析大产物。"""
     try:
         with open(path_str, encoding="utf-8") as f:
             return json.load(f), None
@@ -650,10 +550,6 @@ def _read_json_cached(path_str: str, mtime_ns: int, size: int):
 
 
 def _read_json(filename: str):
-    """返回 (data, error)。文件不存在时 data 为 None 且无 error。
-
-    产物由原子替换写入，mtime/size 变化即触发缓存失效，无需手动清理。
-    """
     path = DATA_DIR / filename
     if not path.exists():
         return None, None
@@ -662,7 +558,6 @@ def _read_json(filename: str):
 
 
 def _read_run_json(batch_id: str, filename: str):
-    """读取指定历史批次的 JSON 产物，返回 (data, error)。"""
     path = RUNS_DIR / batch_id / filename
     if not path.exists():
         return None, None
@@ -670,85 +565,46 @@ def _read_run_json(batch_id: str, filename: str):
     return _read_json_cached(str(path), stat.st_mtime_ns, stat.st_size)
 
 
-def _load_all(batch_id: str | None = None):
-    """加载产物。batch_id 为 None 时读 data/ 顶层最新镜像，否则读历史批次。"""
-    reader = (lambda fn: _read_run_json(batch_id, fn)) if batch_id else _read_json
-    feed, feed_err = reader("raw_feed.json")
-    bench, bench_err = reader("benchmarks.json")
-    probe, probe_err = reader("probe.json")
-    opps, opp_err = reader("opportunities.json")
-    audits, audits_err = reader("audit_results.json")
-    review, review_err = reader("review_queue.json")
-    errors = [e for e in (feed_err, bench_err, probe_err, opp_err,
-                          audits_err, review_err) if e]
-    return feed, bench, probe, opps, audits, review, errors
+def _artifact_reader(batch_id: str | None):
+    return (lambda fn: _read_run_json(batch_id, fn)) if batch_id else _read_json
 
 
-def _history_options() -> list[str]:
-    """历史批次下拉选项（时间倒序，含状态标记）。"""
-    opts = []
-    for item in store.list_runs():
-        meta = item.get("meta", {})
-        status = {"success": "成功", "failed": "失败", "running": "运行中",
-                  "interrupted": "中断"}.get(meta.get("status"), "未知")
-        stage = meta.get("stage", "?")
-        opts.append(f"{item['batch_id']} · {stage} · {status}")
-    return opts
+def _db_path(cfg: dict) -> Path:
+    return database.resolve_db_path(cfg)
 
 
-def _history_batch_id(label: str) -> str | None:
-    """从下拉标签还原 batch_id。"""
-    if not label:
-        return None
-    return label.split(" · ", 1)[0]
+def _ensure_db(cfg: dict) -> Path:
+    path = _db_path(cfg)
+    database.init_db(path)
+    return path
 
 
-def _artifact_rows(batch_id: str | None = None):
-    specs = [
-        ("raw_feed.json", "原始榜单", "captured_at", "apps"),
-        ("benchmarks.json", "精选标杆", "captured_at", "benchmarks"),
-        ("probe.json", "鸿蒙供给探测", "probed_at", "benchmarks"),
-        ("opportunities.json", "机会审计结果", "audited_at", "opportunities"),
-        ("audit_results.json", "完整审计结果", "audited_at", "audits"),
-        ("review_queue.json", "人工复核队列", "generated_at", "items"),
-    ]
-    rows = []
-    for filename, title, ts_key, list_key in specs:
-        path = (RUNS_DIR / batch_id / filename) if batch_id else (DATA_DIR / filename)
-        data, err = (_read_run_json(batch_id, filename) if batch_id
-                     else _read_json(filename))
-        if err:
-            rows.append({"file": filename, "title": title, "ok": False, "count": None,
-                         "ts": "", "note": "文件损坏"})
-            continue
-        if data is None:
-            rows.append({"file": filename, "title": title, "ok": False, "count": None,
-                         "ts": "", "note": "未生成"})
-            continue
-        if isinstance(data, dict):
-            lst = data.get(list_key)
-            count = data.get("count")
-            if count is None and isinstance(lst, list):
-                count = len(lst)
-            ts = data.get(ts_key, "") or ""
-        elif isinstance(data, list):
-            count, ts = len(data), ""
-        else:
-            count, ts = None, ""
-        rows.append({"file": filename, "title": title, "ok": True, "count": count,
-                     "ts": ts, "note": ""})
-    return rows
+@st.cache_data(show_spinner=False)
+def _db_stats(db_path: str, stamp: str):
+    return database.get_stats(db_path)
 
 
-def _fmt_ts(ts: str) -> str:
-    """ISO 时间戳 → 本地可读格式；解析失败时原样回退，不丢信息。"""
-    if not ts:
-        return "—"
-    raw = str(ts)
+@st.cache_data(show_spinner=False)
+def _db_apps(db_path: str, stamp: str, filters_json: str):
+    return database.get_apps(json.loads(filters_json), db_path=db_path)
+
+
+def _db_stamp(db_path: Path) -> str:
     try:
-        return datetime.fromisoformat(raw.replace("Z", "+00:00")).strftime("%Y-%m-%d %H:%M")
-    except ValueError:
-        return raw.replace("T", " ").replace("+08:00", "")
+        stat = db_path.stat()
+        return f"{stat.st_mtime_ns}:{stat.st_size}"
+    except OSError:
+        return "missing"
+
+
+def _load_apps(cfg: dict, filters: dict) -> list[dict]:
+    db_path = _ensure_db(cfg)
+    return _db_apps(str(db_path), _db_stamp(db_path), json.dumps(filters, sort_keys=True))
+
+
+def _load_stats(cfg: dict) -> dict:
+    db_path = _ensure_db(cfg)
+    return _db_stats(str(db_path), _db_stamp(db_path))
 
 
 # --------------------------------------------------------------------------
@@ -759,37 +615,6 @@ def _clip(text, n):
     if not text:
         return ""
     return text if len(text) <= n else text[:n].rstrip() + "…"
-
-
-def _score_class(v):
-    if v >= 8.0:
-        return "high"
-    if v >= 6.0:
-        return "mid"
-    return "low"
-
-
-def _overall(opp) -> float:
-    """容错读取综合分：字段缺失或非数值时按 0 处理，避免整页渲染中断。"""
-    try:
-        return float(opp.get("scores", {}).get("overall", 0) or 0)
-    except (TypeError, ValueError):
-        return 0.0
-
-
-def _bar(label, value, color):
-    try:
-        val = float(value)
-    except (TypeError, ValueError):
-        val = 0.0
-    pct = max(0.0, min(1.0, val / 10.0)) * 100
-    return (
-        f'<div class="bar-wrap">'
-        f'<div class="bar-head"><span class="bar-label">{html.escape(label)}</span>'
-        f'<span class="bar-val">{val:.1f}</span></div>'
-        f'<div class="bar-track" role="img" aria-label="{html.escape(label)} {val:.1f} 分">'
-        f'<div class="bar-fill" style="width:{pct:.1f}%;background:{color}"></div></div></div>'
-    )
 
 
 def _empty_state(title, detail, cmd=None):
@@ -812,34 +637,43 @@ BRAND_MARK = (
     '</svg>'
 )
 
+_TAG_CLASS = {
+    "待刷新": "pill-refresh",
+    "未探测": "pill",
+    "生态空白（待验证）": "pill-blank",
+    "已收藏": "pill-fav",
+}
 
-def _passed(opportunities, min_score):
-    return [o for o in opportunities if _overall(o) >= min_score]
+
+def _tag_html(tags: list[str]) -> str:
+    return "".join(
+        f'<span class="pill {_TAG_CLASS.get(t, "")}">{html.escape(t)}</span>'
+        for t in tags
+    )
 
 
 # --------------------------------------------------------------------------
 # 顶部品牌区
 # --------------------------------------------------------------------------
-def render_brand(state, opp_meta, min_score, opportunities):
-    rows = _artifact_rows()
+def render_brand(state, stats: dict, rows: list):
     ready = sum(1 for r in rows if r["ok"])
+    current_batch = store.latest_run_id() or "—"
     left, right = st.columns([3.2, 1])
     with left:
         st.markdown(
             '<div class="brand">'
             f'<div class="brand-mark">{BRAND_MARK}</div>'
             '<div><div class="brand-title">纯血鸿蒙机会雷达</div>'
-            '<div class="brand-sub">双端供给落差分析 · 从 iOS 精品标杆推导鸿蒙原生机会</div></div>'
+            '<div class="brand-sub">Apple 榜单 → 鸿蒙供给事实 → 本地数据资产 → 按需筛选</div></div>'
             '</div>',
             unsafe_allow_html=True,
         )
-        audited_at = _fmt_ts(opp_meta.get("audited_at", "")) if opp_meta else "—"
-        model = (opp_meta.get("model") or "—") if opp_meta else "—"
         st.markdown(
             '<div class="brand-meta">'
-            f'<div class="item">最近审计 <b>{html.escape(audited_at)}</b></div>'
-            f'<div class="item">审计模型 <b>{html.escape(str(model))}</b></div>'
-            f'<div class="item">数据产物 <b>{ready}/4 就绪</b></div>'
+            f'<div class="item">最近批次 <b>{html.escape(str(current_batch))}</b></div>'
+            f'<div class="item">应用库 <b>{stats.get("total", 0)}</b></div>'
+            f'<div class="item">已探测 <b>{stats.get("probed", 0)}</b></div>'
+            f'<div class="item">产物 <b>{ready}/4 就绪</b></div>'
             '</div>',
             unsafe_allow_html=True,
         )
@@ -848,13 +682,19 @@ def render_brand(state, opp_meta, min_score, opportunities):
             f'<div style="text-align:right;padding-top:6px">{_status_html(state, live=False)}</div>',
             unsafe_allow_html=True,
         )
-        if st.button("刷新数据", use_container_width=True, disabled=_is_running()):
+        if st.button("刷新页面", width="stretch", disabled=_is_running()):
+            st.cache_data.clear()
             st.rerun()
 
 
 def render_history_selector() -> str | None:
-    """顶栏历史批次回溯器：返回选中的 batch_id（None 表示最新镜像）。"""
-    options = _history_options()
+    """历史批次回溯器：返回选中的 batch_id（None 表示最新镜像）。"""
+    options = []
+    for item in store.list_runs():
+        meta = item.get("meta", {})
+        status = {"success": "成功", "failed": "失败", "running": "运行中",
+                  "interrupted": "中断"}.get(meta.get("status"), "未知")
+        options.append(f"{item['batch_id']} · {meta.get('stage', '?')} · {status}")
     if not options:
         return None
     labels = ["最新（data/ 顶层镜像）"] + options
@@ -870,14 +710,13 @@ def render_history_selector() -> str | None:
     st.session_state[HISTORY_KEY] = choice
     if choice == labels[0]:
         return None
-    return _history_batch_id(choice)
+    return choice.split(" · ", 1)[0]
 
 
 # --------------------------------------------------------------------------
 # 运行状态条 + 实时进度 + 结构化日志（片段：仅在运行时轮询）
 # --------------------------------------------------------------------------
 def _progress_html(prog: dict) -> str:
-    """渲染非线性缓动进度条（纯 CSS 动画，无需 JS）。"""
     pct = max(0.0, min(100.0, float(prog.get("pct", 0.0))))
     label = prog.get("label") or "准备中"
     stage = prog.get("stage", "")
@@ -887,6 +726,7 @@ def _progress_html(prog: dict) -> str:
     stage_txt = " · ".join(x for x in (stage, step) if x)
     meta_bits = [b for b in (current, message) if b]
     meta = " · ".join(meta_bits)
+    meta_html = f'<div class="prog-meta">{html.escape(meta)}</div>' if meta else ""
     return (
         f'<div class="prog">'
         f'<div class="prog-head"><span class="prog-label">{html.escape(str(label))}</span>'
@@ -895,13 +735,11 @@ def _progress_html(prog: dict) -> str:
         f'<div class="prog-track" role="progressbar" aria-valuenow="{pct:.0f}" '
         f'aria-valuemin="0" aria-valuemax="100">'
         f'<div class="prog-fill" style="width:{pct:.1f}%"></div></div>'
-        f'{f"<div class=\'prog-meta\'>{html.escape(meta)}</div>" if meta else ""}'
-        f'</div>'
+        f'{meta_html}</div>'
     )
 
 
-def _trace_card(trace: dict, idx: int) -> str:
-    """渲染一张结构化 LLM 调用卡片（原生 details 折叠，无需 JS）。"""
+def _trace_card(trace: dict) -> str:
     ok = trace.get("status") == "success"
     st_cls, st_txt = ("ok", "成功") if ok else ("err", "失败")
     stage = html.escape(str(trace.get("stage") or "—"))
@@ -957,19 +795,18 @@ def _live_fragment():
 
 
 def _render_resume_controls(state):
-    """中断态下的继续控件：显示失败步骤并提供「继续」按钮。"""
     key = state.get("key")
     failed_step = state.get("failed_step") or 0
-    steps = PIPELINE_STEPS.get(key, [])
+    steps = state.get("run_steps") or PIPELINE_STEPS.get(key, [])
     step_label = steps[failed_step][0] if failed_step < len(steps) else "未知步骤"
     st.markdown(
         f'<div class="muted" style="margin-top:8px">'
         f'将在同一批次 <b>{html.escape(str(state.get("batch_id") or "—"))}</b> 中'
-        f'从「{html.escape(step_label)}」重新执行。请先到「控制台」修正配置。'
+        f'从「{html.escape(step_label)}」重新执行。请先到「流水线」修正配置。'
         f'</div>',
         unsafe_allow_html=True,
     )
-    if st.button("继续执行（从失败步骤恢复）", type="primary", use_container_width=False):
+    if st.button("继续执行（从失败步骤恢复）", type="primary"):
         _resume_run()
         st.rerun()
 
@@ -983,7 +820,7 @@ def render_run_strip():
         prog = st.session_state[PROGRESS_KEY]
         traces = st.session_state[TRACES_KEY]
         batch_id = state.get("batch_id")
-        badge = (f' · 批次 <b>{html.escape(str(batch_id))}</b>' if batch_id else "")
+        badge = f' · 批次 <b>{html.escape(str(batch_id))}</b>' if batch_id else ""
         border = {"failed": "rgba(255,138,128,.45)",
                   "interrupted": "rgba(233,165,104,.45)"}.get(
                       state["status"], "var(--border-1)")
@@ -1005,48 +842,46 @@ def render_run_strip():
             _render_resume_controls(state)
         if traces:
             with st.expander(f"LLM 调用追踪（{len(traces)} 次，点击展开详情）", expanded=False):
-                st.markdown("".join(_trace_card(t, i) for i, t in enumerate(traces)),
+                st.markdown("".join(_trace_card(t) for t in traces),
                             unsafe_allow_html=True)
 
 
 # --------------------------------------------------------------------------
 # 侧栏
 # --------------------------------------------------------------------------
-def sidebar_panel(cfg):
+def sidebar_panel(cfg, stats: dict):
     st.sidebar.markdown(
         '<div class="brand-title" style="font-size:1.05rem">纯血鸿蒙机会雷达</div>'
-        '<div class="brand-sub" style="font-size:.72rem">M4 · 情报看板</div>',
+        '<div class="brand-sub" style="font-size:.72rem">M5 · 数据资产 + 按需筛选</div>',
         unsafe_allow_html=True,
     )
     st.sidebar.markdown(_status_html(st.session_state[RUN_KEY], live=False),
                         unsafe_allow_html=True)
     st.sidebar.markdown("---")
 
-    default_score = float(st.session_state.get(MIN_SCORE_KEY, cfg.get("audit", {}).get("min_score", 6.0)))
-    min_score = st.sidebar.slider("最低分门槛", 0.0, 10.0, value=default_score, step=0.5)
-    st.session_state[MIN_SCORE_KEY] = min_score
-    st.sidebar.caption("仅影响看板展示，不改变已写入的审计结果。")
-
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("**扫描**")
     disabled = _is_running()
-    if st.sidebar.button("全量扫描（捕获→探测→审计）", disabled=disabled, use_container_width=True):
+    if st.sidebar.button("全量扫描（捕获 → 探测）", type="primary",
+                         disabled=disabled, width="stretch"):
         _start_run("全量扫描", "full")
         st.rerun()
     c1, c2 = st.sidebar.columns(2)
-    if c1.button("仅捕获", disabled=disabled, use_container_width=True):
+    if c1.button("仅捕获", disabled=disabled, width="stretch"):
         _start_run("仅捕获", "capture")
         st.rerun()
-    if c2.button("仅探测", disabled=disabled, use_container_width=True):
+    if c2.button("仅探测", disabled=disabled, width="stretch"):
         _start_run("仅探测", "probe")
         st.rerun()
-    if st.sidebar.button("仅审计", disabled=disabled, use_container_width=True):
-        _start_run("仅审计", "audit")
+    if st.sidebar.button("AI 筛选（按需）", disabled=disabled, width="stretch"):
+        _start_run("AI 筛选", "filter")
+        st.rerun()
+    if st.sidebar.button("刷新待更新应用", disabled=disabled or not stats.get("stale"),
+                         width="stretch"):
+        _start_run("刷新待更新", "probe", steps=[("供给探测", ["probe", "--only-stale"])])
         st.rerun()
 
     if st.session_state[RUN_KEY].get("status") == "interrupted":
         if st.sidebar.button("继续上次中断的流程", type="primary",
-                             disabled=disabled, use_container_width=True, key="side_resume"):
+                             disabled=disabled, width="stretch", key="side_resume"):
             _resume_run()
             st.rerun()
 
@@ -1057,341 +892,407 @@ def sidebar_panel(cfg):
         f'<div class="logbox small">{html.escape(logs[-1] if logs else "暂无日志")}</div>',
         unsafe_allow_html=True,
     )
-    st.sidebar.caption("完整日志见「控制台」标签。")
-    return min_score
+    st.sidebar.caption("完整日志见「流水线」标签。")
 
 
 # --------------------------------------------------------------------------
-# 标签 1：机会总览
+# 标签 1：数据库
 # --------------------------------------------------------------------------
-def render_kpi_row(opportunities, min_score, audit_meta=None, review_meta=None,
-                   probe_data=None):
-    passed = _passed(opportunities, min_score)
-    blanks = [o for o in passed if o.get("is_blank")]
-    high = [o for o in passed if _overall(o) >= 8.0]
-    avg = sum(_overall(o) for o in passed) / len(passed) if passed else 0.0
-    total_audited = (audit_meta or {}).get("total_audited", len(opportunities))
-    review_count = (review_meta or {}).get("count", 0)
-    # 生态空白与请求错误来自 probe 状态，绝不含糊
-    probe_records = (probe_data or {}).get("benchmarks", []) if isinstance(probe_data, dict) else []
-    confirmed_empty = sum(1 for r in probe_records
-                          if r.get("probe_status") == "confirmed_empty")
-    request_errors = sum(1 for r in probe_records
-                         if r.get("probe_status") == "request_error")
-    cards = [
-        ("审计总数", str(total_audited), "四维审计覆盖范围", ""),
-        ("达标机会", str(len(passed)), f"综合分 ≥ {min_score:.1f}", "sig"),
-        ("高优机会", str(len(high)), "综合分 ≥ 8.0", ""),
-        ("确认空白", str(confirmed_empty), "检索确认无同类", "gap"),
-        ("人工复核", str(review_count), "低证据/临界项", ""),
-        ("请求错误", str(request_errors), "检索失败，非空白", ""),
-        ("平均综合分", f"{avg:.1f}", "仅统计达标机会", ""),
-    ]
+def _filter_controls() -> dict:
+    """筛选器：返回 database.get_apps 可用的 filters dict。"""
+    c1, c2, c3 = st.columns([1.1, 1.2, 1.2])
+    period = c1.selectbox("时间范围", ["全部", "最近 7 天", "最近 30 天", "最近 90 天"],
+                          index=0)
+    comp = c2.selectbox("竞品数", ["全部", "0 个（空白）", "1-2 个（低竞争）",
+                                   "3+ 个（高竞争）"], index=0)
+    rating = c3.selectbox("竞品评分", ["全部", "无竞品", "低分 (<3.5)",
+                                       "中分 (3.5-4.0)", "高分 (>4.0)"], index=0)
+
+    c4, c5, c6 = st.columns([1.2, 1.1, 1.4])
+    pain = c4.selectbox("差评痛点", ["全部", "无差评痛点", "有高频痛点", "有中频痛点"],
+                        index=0)
+    refresh = c5.selectbox("刷新状态", ["全部", "仅待刷新"], index=0)
+    query = c6.text_input("搜索", placeholder="应用名 / JTBD / 开发者")
+
+    c7, c8 = st.columns([1, 3])
+    favorite = c7.checkbox("仅看收藏", value=False)
+
+    filters = {}
+    days_map = {"最近 7 天": 7, "最近 30 天": 30, "最近 90 天": 90}
+    if period in days_map:
+        filters["days"] = days_map[period]
+    comp_map = {"0 个（空白）": "0", "1-2 个（低竞争）": "1-2",
+                "3+ 个（高竞争）": "3+"}
+    if comp in comp_map:
+        filters["competitor"] = comp_map[comp]
+    rating_map = {"无竞品": "none", "低分 (<3.5)": "low",
+                  "中分 (3.5-4.0)": "mid", "高分 (>4.0)": "high"}
+    if rating in rating_map:
+        filters["rating"] = rating_map[rating]
+    pain_map = {"无差评痛点": "none", "有高频痛点": "high", "有中频痛点": "mid"}
+    if pain in pain_map:
+        filters["pain"] = pain_map[pain]
+    if refresh == "仅待刷新":
+        filters["refresh"] = "stale"
+    if favorite:
+        filters["favorite"] = True
+    if (query or "").strip():
+        filters["query"] = query.strip()
+    return filters
+
+
+def _apps_table(apps: list[dict]) -> list[dict]:
+    """转成表格行（中文表头）。"""
+    rows = []
+    for app in apps:
+        row = viewmodel.app_row(app)
+        row["状态"] = " / ".join(row["tags"]) or "—"
+        rows.append(row)
+    return rows
+
+
+def render_database(cfg: dict, stats: dict):
+    cards = viewmodel.stats_cards(stats)
     cells = "".join(
-        f'<div class="stat"><div class="stat-k">{html.escape(label)}</div>'
-        f'<div class="stat-v {cls}">{html.escape(value)}</div>'
-        f'<div class="stat-s">{html.escape(sub)}</div></div>'
-        for label, value, sub, cls in cards
+        f'<div class="stat"><div class="stat-k">{html.escape(c["label"])}</div>'
+        f'<div class="stat-v {c["tone"]}">{html.escape(c["value"])}</div>'
+        f'<div class="stat-s">{html.escape(c["sub"])}</div></div>'
+        for c in cards
     )
     st.markdown(f'<div class="statline">{cells}</div>', unsafe_allow_html=True)
+    st.markdown("")
 
-
-def _dim_legend():
-    """维度名与配色只在表头出现一次，替代在每一行重复 4 次标签。"""
-    items = "".join(
-        f'<span><b style="background:{color}"></b>{html.escape(label)}</span>'
-        for label, _, color, _ in DIM_META
-    )
-    return f'<div class="lh-dims">{items}</div>'
-
-
-def render_ladder(opportunities, min_score):
-    rows = _passed(opportunities, min_score)
-    if not rows:
-        _empty_state("当前门槛下无入选机会", "降低最低分门槛，或先运行一次审计。",
-                     "python -m radar audit")
+    if not stats.get("total"):
+        _empty_state("数据库还是空的", "先运行一次「全量扫描」把 Apple 榜单应用抓进来。",
+                     "python -m radar capture")
         return
 
-    ctrl1, ctrl2, ctrl3 = st.columns([1.2, 1.4, 2])
-    sort_by = ctrl1.selectbox(
-        "排序", ["综合分降序", "需求降序", "落差降序", "原生降序", "可行性降序"], index=0
-    )
-    view = ctrl2.selectbox("过滤", ["全部机会", "高优机会（≥8.0）", "生态空白"], index=0)
+    with st.expander("筛选器", expanded=True):
+        filters = _filter_controls()
 
-    sort_key = {
-        "综合分降序": "overall",
-        "需求降序": "demand",
-        "落差降序": "experience_gap",
-        "原生降序": "native_advantage",
-        "可行性降序": "indie_feasibility",
-    }[sort_by]
-    rows = sorted(rows, key=lambda o: float(o["scores"].get(sort_key, 0) or 0), reverse=True)
-
-    if view == "高优机会（≥8.0）":
-        rows = [o for o in rows if _overall(o) >= 8.0]
-    elif view == "生态空白":
-        rows = [o for o in rows if o.get("is_blank")]
-
-    ctrl3.markdown(
-        f'<div class="muted" style="padding-top:32px">共 {len(rows)} 条</div>',
+    apps = _load_apps(cfg, filters)
+    st.markdown(
+        f'<div class="muted">当前条件：{html.escape(viewmodel.filter_echo(filters))}'
+        f' · 命中 {len(apps)} 个应用</div>',
         unsafe_allow_html=True,
     )
-
-    if not rows:
-        _empty_state("过滤后无结果", "切换过滤条件，或降低门槛。")
+    if not apps:
+        _empty_state("没有符合条件的应用", "放宽筛选条件，或先运行一次探测补充供给事实。")
         return
 
-    parts = [
-        '<div class="ladder"><div class="ladder-head">'
-        '<div class="lh-cols"><div>#</div><div>应用</div><div>综合</div><div>定性结论</div></div>'
-        + _dim_legend() + '</div>'
-    ]
-    for i, opp in enumerate(rows, 1):
-        s = opp["scores"]
-        overall = _overall(opp)
-        blank = bool(opp.get("is_blank"))
-        pill = '<span class="pill pill-blank">生态空白</span>' if blank else ""
-        parts.append(
-            f'<div class="ladder-row{" blank" if blank else ""}">'
-            f'<div class="lr-head">'
-            f'<div class="lr-rank">{i:02d}</div>'
-            f'<div class="lr-name">{html.escape(str(opp.get("benchmark_name", "?")))} {pill}</div>'
-            f'<div><span class="badge {_score_class(overall)}">'
-            f'{overall:.1f}</span></div>'
-            f'<div class="lr-verdict">{html.escape(_clip(opp.get("verdict", ""), 68))}</div>'
-            f'</div><div class="lr-bars">'
-            + "".join(_bar(label, s.get(key, 0), color) for label, key, color, _ in DIM_META)
-            + '</div></div>'
-        )
-    parts.append("</div>")
-    st.markdown("".join(parts), unsafe_allow_html=True)
+    rows = _apps_table(apps)
+    table = [{
+        "应用名": r["name"],
+        "JTBD": _clip(r["jtbd"], 42),
+        "首次出现": r["first_seen"],
+        "最近出现": r["last_seen"],
+        "竞品数": r["competitor_count"],
+        "平均评分": r["avg_rating"],
+        "痛点": r["pain"],
+        "状态": r["状态"],
+    } for r in rows]
+    st.dataframe(table, width="stretch", hide_index=True, height=420)
 
-
-def render_report_section(opp_meta, batch_id: str | None = None):
     st.markdown("---")
-    report_path = (RUNS_DIR / batch_id / "report.md") if batch_id else (DATA_DIR / "report.md")
-    with st.expander("决策报告预览与下载", expanded=False):
-        if not report_path.exists():
-            _empty_state("报告未生成", "先运行审计以生成决策报告。", "python -m radar audit")
-            return
-        try:
-            content = report_path.read_text(encoding="utf-8")
-        except Exception as exc:
-            _empty_state("报告读取失败", f"{exc}")
-            return
-        if opp_meta:
-            st.markdown(
-                f'<div class="muted">生成时间 {html.escape(_fmt_ts(opp_meta.get("audited_at", "")))}'
-                f' &nbsp; 审计模型 {html.escape(str(opp_meta.get("model") or "—"))}'
-                f' &nbsp; 门槛 {opp_meta.get("min_score", "—")}</div>',
-                unsafe_allow_html=True,
-            )
-        st.download_button(
-            "下载 report.md",
-            data=content,
-            file_name=f"report_{batch_id}.md" if batch_id else "report.md",
-            mime="text/markdown",
-            use_container_width=False,
-        )
-        st.markdown(content)
+    c1, c2, c3 = st.columns([2.2, 1.2, 1.2])
+    labels = {r["apple_id"]: f'{r["name"]} · 竞品 {r["competitor_count"]} · {r["pain"]}'
+              for r in rows}
+    selected_id = c1.selectbox("查看详情 / 操作", list(labels.keys()),
+                               format_func=lambda k: labels[k], key="db_detail_select")
+    disabled = _is_running()
+    if c2.button("刷新选中应用", disabled=disabled, width="stretch"):
+        _start_run("刷新选中", "probe",
+                   steps=[("供给探测", ["probe", "--apple-ids", selected_id])])
+        st.rerun()
+    csv_bytes = database.csv_text(filters, db_path=_db_path(cfg))
+    c3.download_button("导出 CSV", data=csv_bytes.encode("utf-8-sig"),
+                       file_name="harmony_apps.csv", mime="text/csv",
+                       width="stretch",
+                       help=f"按当前筛选条件导出 {len(apps)} 条")
+
+    if stats.get("stale"):
+        if st.button(f"刷新全部待刷新（{stats['stale']} 个）", disabled=disabled):
+            _start_run("刷新待更新", "probe",
+                       steps=[("供给探测", ["probe", "--only-stale"])])
+            st.rerun()
+
+    if selected_id:
+        render_app_detail(cfg, selected_id)
 
 
-# --------------------------------------------------------------------------
-# 标签 2 / 3：机会详情与生态空白
-# --------------------------------------------------------------------------
-def _fact_value(text):
-    return html.escape(str(text)) if text not in (None, "") else "—"
-
-
-def render_deep_card(opp):
-    s = opp["scores"]
-    overall = _overall(opp)
-    blank = bool(opp.get("is_blank"))
-    comps = opp.get("competitors") or []
-    bad_total = sum(int(c.get("bad_review_count") or 0) for c in comps)
-    scores_num = []
-    for c in comps:
-        try:
-            scores_num.append(float(str(c.get("score", "")).strip()))
-        except (TypeError, ValueError):
-            pass
-    avg_score = f"{sum(scores_num) / len(scores_num):.1f}" if scores_num else "—"
-
-    pill = '<span class="pill pill-blank">生态空白</span>' if blank else ""
-    grade = opp.get("evidence_grade", "")
-    grade_pill = (f'<span class="pill">证据 {html.escape(str(grade))}</span>'
-                  if grade else "")
-    status = opp.get("probe_status", "")
-    status_pill = (f'<span class="pill">状态 {html.escape(str(status))}</span>'
-                   if status else "")
-    st.markdown(
-        f'<div class="detail-head"><span class="detail-name">'
-        f'{html.escape(str(opp.get("benchmark_name", "?")))}</span>{pill}'
-        f'{grade_pill}{status_pill}'
-        f'<span class="badge {_score_class(overall)}">{overall:.1f}</span>'
-        f'<span class="muted">by {html.escape(str(opp.get("artist") or "—"))}</span></div>',
-        unsafe_allow_html=True,
-    )
-    if opp.get("jtbd"):
-        st.markdown(f'<div class="muted">JTBD · {html.escape(str(opp["jtbd"]))}</div>',
-                    unsafe_allow_html=True)
-    if opp.get("pick_reason"):
-        st.markdown(f'<div class="muted">入选理由 · {html.escape(str(opp["pick_reason"]))}</div>',
-                    unsafe_allow_html=True)
-
-    st.markdown(
-        '<div class="lr-bars" style="margin-top:14px">'
-        + "".join(_bar(label, s.get(key, 0), color) for label, key, color, _ in DIM_META)
-        + "</div>",
-        unsafe_allow_html=True,
-    )
-
-    if opp.get("verdict"):
-        st.markdown(f'<div class="verdict" style="margin-top:14px">'
-                    f'{html.escape(str(opp["verdict"]))}</div>', unsafe_allow_html=True)
-
-    st.markdown('<div class="panel-title" style="margin-top:16px">事实依据</div>',
-                unsafe_allow_html=True)
-    if blank:
+def render_app_detail(cfg: dict, apple_id: str):
+    detail = database.get_app_detail(apple_id, db_path=_db_path(cfg))
+    if not detail:
+        return
+    tags = viewmodel.status_tags(detail)
+    with st.container(key="detail_card"):
         st.markdown(
-            '<div class="facts">'
-            '<div class="fact"><div class="fact-k">鸿蒙同类竞品</div>'
-            '<div class="fact-v" style="color:var(--gold)">0 · 生态空白</div></div>'
-            '<div class="fact"><div class="fact-k">数据来源</div>'
-            '<div class="fact-v" style="font-size:.85rem">华为市场接口</div></div>'
-            '</div>'
-            '<div class="muted" style="margin-top:8px">未检出真实同类竞品，可直接抢跑。</div>',
+            f'<div class="detail-head"><span class="detail-name">'
+            f'{html.escape(str(detail.get("name", "?")))}</span>'
+            f'{_tag_html(tags)}</div>',
             unsafe_allow_html=True,
         )
-    else:
-        review_total = sum(
-            int((c.get("comment_stats") or {}).get("fetched") or 0) for c in comps)
+        st.markdown(
+            f'<div class="muted">by {html.escape(str(detail.get("artist") or "—"))}'
+            f' · Apple ID {html.escape(str(detail.get("apple_id") or "—"))}</div>',
+            unsafe_allow_html=True,
+        )
+        if detail.get("jtbd"):
+            st.markdown(f'<div class="muted">JTBD · {html.escape(str(detail["jtbd"]))}</div>',
+                        unsafe_allow_html=True)
+        if detail.get("pick_reason"):
+            st.markdown(f'<div class="muted">入选理由 · '
+                        f'{html.escape(str(detail["pick_reason"]))}</div>',
+                        unsafe_allow_html=True)
+
+        rounds = detail.get("rounds") or []
+        comps = detail.get("competitors") or []
+        ratings = [c.get("rating") for c in comps
+                   if isinstance(c.get("rating"), (int, float))]
+        avg = f"{sum(ratings) / len(ratings):.2f}" if ratings else "—"
+        high = sum(1 for c in comps for p in c.get("pain_points", [])
+                   if p.get("frequency") == "高频")
+        mid = sum(1 for c in comps for p in c.get("pain_points", [])
+                  if p.get("frequency") == "中频")
         st.markdown(
             '<div class="facts">'
-            f'<div class="fact"><div class="fact-k">同类竞品</div>'
-            f'<div class="fact-v">{len(comps)}</div></div>'
-            f'<div class="fact"><div class="fact-k">平均竞品评分</div>'
-            f'<div class="fact-v">{avg_score}</div></div>'
-            f'<div class="fact"><div class="fact-k">差评样本</div>'
-            f'<div class="fact-v" style="color:var(--amber)">{bad_total}</div></div>'
-            f'<div class="fact"><div class="fact-k">评论采样</div>'
-            f'<div class="fact-v">{review_total}</div></div>'
-            f'<div class="fact"><div class="fact-k">证据等级</div>'
-            f'<div class="fact-v">{_fact_value(grade)}</div></div>'
+            f'<div class="fact"><div class="fact-k">最近探测</div>'
+            f'<div class="fact-v" style="font-size:.9rem">'
+            f'{html.escape(viewmodel.fmt_ts(detail.get("last_probe_at") or ""))}</div></div>'
+            f'<div class="fact"><div class="fact-k">Probe 状态</div>'
+            f'<div class="fact-v" style="font-size:.9rem">'
+            f'{html.escape(str(detail.get("probe_status") or "未探测"))}</div></div>'
+            f'<div class="fact"><div class="fact-k">竞品数</div>'
+            f'<div class="fact-v">{detail.get("competitor_count", 0)}</div></div>'
+            f'<div class="fact"><div class="fact-k">平均评分</div>'
+            f'<div class="fact-v">{avg}</div></div>'
+            f'<div class="fact"><div class="fact-k">高频 / 中频痛点</div>'
+            f'<div class="fact-v" style="color:var(--amber)">{high} / {mid}</div></div>'
+            f'<div class="fact"><div class="fact-k">采集轮次</div>'
+            f'<div class="fact-v">{len(rounds)}</div></div>'
             '</div>',
             unsafe_allow_html=True,
         )
+
+        if detail.get("is_blank"):
+            st.markdown(
+                '<div class="verdict" style="margin-top:14px;border-color:rgba(255,213,79,.35)">'
+                '本次检索未发现有效同类竞品 —— 这是待验证假设，'
+                '不等于该品类在市场绝对不存在。</div>',
+                unsafe_allow_html=True,
+            )
+
         if comps:
-            st.markdown('<div class="panel-title" style="margin-top:16px">竞品事实与差评痛点</div>',
+            st.markdown('<div class="panel-title" style="margin-top:16px">竞品与差评痛点</div>',
                         unsafe_allow_html=True)
-            for c in comps:
-                pains = c.get("pain_summary") or []
+            for c in comps[:6]:
+                pains = c.get("pain_points") or []
                 pain_html = "".join(
-                    f'<div class="pain">· {html.escape(str(p))}</div>' for p in pains
+                    f'<div class="pain">· [{html.escape(str(p.get("frequency") or "—"))}] '
+                    f'{html.escape(str(p.get("issue") or ""))}'
+                    + (f' <span class="muted">「{html.escape(_clip(p.get("quote"), 60))}」</span>'
+                       if p.get("quote") else "")
+                    + '</div>'
+                    for p in pains
                 )
                 st.markdown(
                     f'<div class="comp-row"><div class="comp-name">'
-                    f'{html.escape(str(c.get("name", "?")))}</div>'
+                    f'{html.escape(str(c.get("name") or "?"))}</div>'
                     f'<div class="comp-meta">'
-                    f'<span>评分 {_fact_value(c.get("score"))}</span>'
-                    f'<span>下载 {_fact_value(c.get("downloads"))}</span>'
-                    f'<span>分类 {_fact_value(c.get("category"))}</span>'
-                    f'<span>差评 {int(c.get("bad_review_count") or 0)} 条</span></div>'
-                    f'{pain_html}</div>',
+                    f'<span>评分 {html.escape(str(c.get("rating") if c.get("rating") is not None else "—"))}</span>'
+                    f'<span>下载 {html.escape(str(c.get("downloads") or "—"))}</span>'
+                    f'<span>分类 {html.escape(str(c.get("category") or "—"))}</span>'
+                    f'<span>采集于 {html.escape(viewmodel.fmt_ts(c.get("probed_at") or ""))}</span></div>'
+                    f'{pain_html or "<div class=muted>本次未提炼到痛点</div>"}</div>',
                     unsafe_allow_html=True,
                 )
         else:
-            st.markdown('<div class="muted">未记录竞品明细。</div>', unsafe_allow_html=True)
+            st.markdown('<div class="muted" style="margin-top:12px">尚无竞品快照。</div>',
+                        unsafe_allow_html=True)
 
-    feats = opp.get("native_features") or []
-    st.markdown('<div class="panel-title" style="margin-top:16px">鸿蒙原生赋能建议</div>',
-                unsafe_allow_html=True)
-    if feats:
-        st.markdown("".join(f"- {html.escape(str(f))}\n" for f in feats))
-    else:
-        st.markdown('<div class="muted">暂无原生能力建议。</div>', unsafe_allow_html=True)
+        if len(rounds) > 1:
+            with st.expander(f"Probe 历史（{len(rounds)} 轮）", expanded=False):
+                timeline = [{
+                    "探测时间": viewmodel.fmt_ts(r.get("probed_at", "")),
+                    "竞品数": r.get("competitor_count", 0),
+                    "平均评分": r.get("avg_rating") if r.get("avg_rating") is not None else "—",
+                    "高频痛点": r.get("high_pain_count", 0),
+                } for r in rounds]
+                st.dataframe(timeline, width="stretch", hide_index=True)
 
-    if opp.get("attack_vector"):
-        st.markdown(f'<div class="panel-title" style="margin-top:16px">MVP 突破切入点</div>'
-                    f'<div class="verdict">{html.escape(str(opp["attack_vector"]))}</div>',
-                    unsafe_allow_html=True)
-    if opp.get("indie_advice"):
-        with st.expander("独立开发者行动建议"):
-            st.markdown(str(opp["indie_advice"]))
-
-
-def render_details(opportunities, min_score):
-    passed = _passed(opportunities, min_score)
-    if not passed:
-        _empty_state("当前门槛下无机会可查看", "降低门槛，或先运行一次「仅审计」。")
-        return
-    options = {
-        o.get("apple_id") or o["benchmark_name"]: o
-        for o in passed
-    }
-    labels = {
-        key: f"{o['benchmark_name']} · {_overall(o):.1f} 分"
-        + ("（生态空白）" if o.get("is_blank") else "")
-        for key, o in options.items()
-    }
-    choice = st.selectbox("选择机会", list(options.keys()), format_func=lambda k: labels[k])
-    with st.container(key="detail_card"):
-        render_deep_card(options[choice])
-
-
-def render_review_queue(review_meta, audit_meta):
-    """人工复核队列：展示请求错误、低证据与临界项，供人工定夺。"""
-    items = (review_meta or {}).get("items", []) if isinstance(review_meta, dict) else []
-    if not items:
-        _empty_state("当前无需人工复核", "所有审计项证据充分或已达标。",
-                     "python -m radar audit")
-        return
-    st.markdown(
-        f'<div class="muted">共 {len(items)} 项待人工复核：请求错误、LLM 过滤失败、'
-        f'低证据等级或临界分数。这些项不会被当作生态空白或高潜机会。</div>',
-        unsafe_allow_html=True,
-    )
-    for i, item in enumerate(items):
-        with st.container(key=f"review_card_{i}"):
-            title = item.get("benchmark_name", "?")
-            grade = item.get("evidence_grade", "")
-            status = item.get("probe_status", "")
-            reasons = "、".join(item.get("reason_codes", []))
-            st.markdown(
-                f'<div class="muted"><b>{html.escape(str(title))}</b> '
-                f'· 证据 {html.escape(str(grade))} · 状态 {html.escape(str(status))} '
-                f'· 原因 {html.escape(reasons)}</div>',
-                unsafe_allow_html=True,
-            )
-            for q in item.get("review_questions", []):
-                st.caption(q)
-
-
-def render_ecosystem(opportunities, min_score):
-    # 仅接受「确认空白」：排除请求错误与未验证的 LLM 结果
-    blanks = sorted(
-        [o for o in opportunities
-         if o.get("is_blank")
-         and o.get("probe_status", "") != "request_error"
-         and _overall(o) >= min_score],
-        key=_overall,
-        reverse=True,
-    )
-    if not blanks:
-        _empty_state("当前门槛下无生态空白机会", "降低门槛，或先运行探测确认供给空缺。",
-                     "python -m radar probe")
-        return
-    st.markdown(
-        f'<div class="muted">共 {len(blanks)} 个通过门槛的生态空白机会，未检出真实同类竞品，可直接抢跑。</div>',
-        unsafe_allow_html=True,
-    )
-    for i, opp in enumerate(blanks):
-        with st.container(key=f"gap_card_{i}"):
-            render_deep_card(opp)
+        c1, c2 = st.columns([1, 3])
+        fav_label = "取消收藏" if detail.get("is_favorite") else "加入收藏"
+        if c1.button(fav_label, key=f"fav_{apple_id}"):
+            database.toggle_favorite(apple_id, db_path=_db_path(cfg))
+            st.cache_data.clear()
+            st.rerun()
 
 
 # --------------------------------------------------------------------------
-# 标签 4：控制台
+# 标签 2：AI 助手
+# ------------------------------------------------------------------
+FILTER_PROMPT_NAME = "user_filter"
+
+
+def _filter_results(cfg: dict) -> dict:
+    data = store.load_filter_results()
+    return data if isinstance(data, dict) else {}
+
+
+def render_filter_prompt_editor():
+    """AI 助手页的专用编辑器（widget key 与「提示词微调」页区分开）。"""
+    name = FILTER_PROMPT_NAME
+    spec = prompts.PROMPT_TEMPLATES[name]
+    current = prompts.get_prompt(name)
+    customized = prompts.is_customized(name)
+    badge = ('<span class="custom-badge">已自定义</span>' if customized else
+             '<span class="muted">内建默认</span>')
+    ph = "".join(f'<span class="ph-chip">{{{p}}}</span>' for p in spec["placeholders"])
+    st.markdown(
+        f'<div class="prompt-head"><span class="prompt-name">{html.escape(spec["label"])}</span>'
+        f'<span class="muted">prompts/{name}.txt</span>{badge}</div>'
+        f'<div style="margin-bottom:6px">必要占位符: {ph}</div>',
+        unsafe_allow_html=True,
+    )
+    widget_key = f"filter_edit_{name}"
+    sync_key = f"{PROMPT_SYNC_PREFIX}filter_{name}"
+    if st.session_state.get(sync_key) != current:
+        st.session_state[widget_key] = current
+        st.session_state[sync_key] = current
+    st.session_state.setdefault(widget_key, current)
+    text = st.text_area("筛选提示词", key=widget_key, height=380,
+                        label_visibility="collapsed")
+    c1, c2, c3 = st.columns([1, 1, 2])
+    if c1.button("保存提示词", type="primary", width="stretch",
+                 disabled=_is_running()):
+        errors = prompts.validate_prompt(name, text)
+        if errors:
+            for e in errors:
+                st.error(e)
+        else:
+            prompts.save_prompt(name, text)
+            st.session_state[sync_key] = text
+            # 提示词微调页的编辑器需要重新同步
+            st.session_state.pop(f"{PROMPT_SYNC_PREFIX}{name}", None)
+            st.toast("筛选提示词已保存，下次筛选立即生效")
+            st.rerun()
+    if c2.button("恢复默认", width="stretch", disabled=_is_running()):
+        prompts.reset_prompt(name)
+        st.session_state.pop(sync_key, None)
+        st.session_state.pop(f"{PROMPT_SYNC_PREFIX}{name}", None)
+        st.toast("已恢复默认提示词")
+        st.rerun()
+    if c3.button("导出全部默认模板", width="stretch", disabled=_is_running()):
+        written = prompts.export_defaults(overwrite=False)
+        st.toast(f"已导出 {len(written)} 个默认模板（不覆盖已有自定义文件）")
+
+
+def _render_opportunity_card(opp: dict, cfg: dict, idx: int):
+    blank = bool(opp.get("is_blank"))
+    key_prefix = "gap_card_" if blank else "opp_card_"
+    with st.container(key=f"{key_prefix}{idx}"):
+        tags = ['<span class="pill pill-blank">生态空白（待验证）</span>'] if blank else []
+        apple_id = str(opp.get("apple_id") or "")
+        detail = database.get_app_detail(apple_id, db_path=_db_path(cfg)) if apple_id else {}
+        if detail and detail.get("is_favorite"):
+            tags.append('<span class="pill pill-fav">已收藏</span>')
+        st.markdown(
+            f'<div class="detail-head"><span class="detail-name">'
+            f'{html.escape(str(opp.get("name", "?")))}</span>{"".join(tags)}'
+            f'<span class="muted">by {html.escape(str(opp.get("artist") or "—"))}</span></div>'
+            f'<div class="muted">JTBD · {html.escape(str(opp.get("jtbd") or "—"))}</div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(f'<div class="verdict" style="margin-top:10px">'
+                    f'{html.escape(str(opp.get("why_pick") or ""))}</div>',
+                    unsafe_allow_html=True)
+        st.markdown(
+            '<div class="facts" style="margin-top:10px">'
+            f'<div class="fact"><div class="fact-k">竞品概况</div>'
+            f'<div class="fact-v" style="font-size:.85rem;font-weight:500">'
+            f'{html.escape(str(opp.get("competitors_summary") or "—"))}</div></div>'
+            f'<div class="fact"><div class="fact-k">突破切入点</div>'
+            f'<div class="fact-v" style="font-size:.85rem;font-weight:500">'
+            f'{html.escape(str(opp.get("attack_vector") or "—"))}</div></div>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+        feats = opp.get("native_features") or []
+        if feats:
+            st.markdown("**鸿蒙原生能力** · " + "、".join(
+                f'<span class="pill pill-fav">{html.escape(str(f))}</span>' for f in feats),
+                unsafe_allow_html=True)
+        c1, c2 = st.columns([1, 4])
+        if apple_id:
+            fav_label = "取消收藏" if (detail or {}).get("is_favorite") else "加入收藏"
+            if c1.button(fav_label, key=f"opp_fav_{apple_id}_{idx}"):
+                database.toggle_favorite(apple_id, db_path=_db_path(cfg))
+                st.cache_data.clear()
+                st.rerun()
+
+
+def render_filter_page(cfg: dict, stats: dict):
+    st.markdown(
+        '<div class="muted">把数据库里的全部事实交给 AI，按你写的标准挑机会。'
+        'AI 只负责筛选与说明理由，不做固定打分，也不会丢弃任何原始数据。</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown('<div class="panel-title" style="margin-top:12px">第一步 · 筛选提示词</div>',
+                unsafe_allow_html=True)
+    render_filter_prompt_editor()
+
+    st.markdown('<div class="panel-title" style="margin-top:12px">第二步 · 执行筛选</div>',
+                unsafe_allow_html=True)
+    filter_cfg = cfg.get("filter") or {}
+    st.markdown(
+        f'<div class="muted">取样范围：最近 {filter_cfg.get("recent_days", 60)} 天出现、'
+        f'最多 {filter_cfg.get("max_apps", 300)} 个应用；输出上限 '
+        f'{filter_cfg.get("max_results", 20)} 个机会。可在「流水线 → 配置」调整。</div>',
+        unsafe_allow_html=True,
+    )
+    c1, c2 = st.columns([1, 3])
+    if c1.button("执行 AI 筛选", type="primary", width="stretch",
+                 disabled=_is_running()):
+        _start_run("AI 筛选", "filter")
+        st.rerun()
+    if not stats.get("probed"):
+        c2.caption("提示：还没有任何 probe 结果，AI 只能基于 Apple 侧信息判断，"
+                   "建议先跑一次「仅探测」。")
+
+    st.markdown('<div class="panel-title" style="margin-top:16px">第三步 · 结果</div>',
+                unsafe_allow_html=True)
+    result = _filter_results(cfg)
+    if not result:
+        _empty_state("还没有筛选结果", "写好提示词后点「执行 AI 筛选」。",
+                     "python -m radar filter")
+        return
+
+    ops = result.get("opportunities", [])
+    st.markdown(
+        f'<div class="muted">生成时间 {html.escape(viewmodel.fmt_ts(result.get("filtered_at", "")))}'
+        f' · 模型 {html.escape(str(result.get("model") or "—"))}'
+        f' · 输入 {result.get("input_count", 0)} 个应用'
+        f' · 输出 {len(ops)} 个机会</div>',
+        unsafe_allow_html=True,
+    )
+    if not ops:
+        _empty_state("AI 没有挑出机会", "放宽提示词里的筛选标准，或补充更多应用后再试。")
+        return
+
+    from radar.pipeline.filter import render_markdown
+    markdown = render_markdown(result)
+    c1, c2 = st.columns([1, 3])
+    c1.download_button("导出 Markdown", data=markdown,
+                       file_name="harmony_opportunities.md", mime="text/markdown",
+                       width="stretch")
+    c2.caption(f"共 {len(ops)} 个候选，点击卡片下方按钮可加入本地收藏。")
+
+    for i, opp in enumerate(ops):
+        _render_opportunity_card(opp, cfg, i)
+
+
+# --------------------------------------------------------------------------
+# 标签 3：流水线
 # --------------------------------------------------------------------------
 def _config_from_form(form):
     return {
@@ -1418,7 +1319,16 @@ def _config_from_form(form):
             "filter_candidates_limit": int(form["filter_candidates_limit"]),
             "enable_llm_filter": bool(form["enable_llm_filter"]),
         },
-        "audit": {"min_score": float(form["min_score"])},
+        "database": {
+            "path": form["db_path"].strip(),
+            "refresh_threshold_days": int(form["refresh_threshold_days"]),
+            "auto_clean_days": int(form["auto_clean_days"]),
+        },
+        "filter": {
+            "recent_days": int(form["recent_days"]),
+            "max_apps": int(form["max_apps"]),
+            "max_results": int(form["max_results"]),
+        },
     }
 
 
@@ -1426,11 +1336,12 @@ def _render_config_form(cfg):
     llm = cfg.get("llm", {})
     cap = cfg.get("capture", {})
     prb = cfg.get("probe", {})
-    aud = cfg.get("audit", {})
+    dbc = cfg.get("database", {})
+    flt = cfg.get("filter", {})
 
     with st.form("config_form"):
         st.markdown("**LLM 推理配置**")
-        st.caption("影响 capture / probe / audit 全部阶段。")
+        st.caption("影响 capture / probe / filter 全部阶段。")
         base_url = st.text_input("API 地址", value=llm.get("base_url", ""))
         api_key = st.text_input("API Key", value=llm.get("api_key", ""), type="password")
         model = st.text_input("模型名称", value=llm.get("model", ""))
@@ -1469,17 +1380,34 @@ def _render_config_form(cfg):
                                         value=int(prb.get("comment_pages", 4)), step=1)
         filter_candidates_limit = st.number_input("LLM 候选过滤上限", min_value=1, max_value=50,
                                                   value=int(prb.get("filter_candidates_limit", 8)), step=1)
-        enable_llm_filter = st.checkbox("启用 LLM 语义去噪", value=bool(prb.get("enable_llm_filter", True)))
+        enable_llm_filter = st.checkbox("启用 LLM 语义去噪",
+                                        value=bool(prb.get("enable_llm_filter", True)))
 
         st.markdown("---")
-        st.markdown("**审计写入门槛**")
-        st.caption("决定 audit 阶段写入 opportunities.json 的最低分；侧栏滑块只改看板展示。")
-        min_score = st.number_input("最低分门槛", min_value=0.0, max_value=10.0,
-                                    value=float(aud.get("min_score", 6.0)), step=0.5)
+        st.markdown("**本地数据库配置**")
+        st.caption("数据库只增不减；超过阈值未 probe 的应用会被标记为待刷新。")
+        db_path = st.text_input("数据库路径", value=str(dbc.get("path", "data/apps.db")))
+        refresh_threshold_days = st.number_input("待刷新阈值（天）", min_value=1,
+                                                 max_value=3650,
+                                                 value=int(dbc.get("refresh_threshold_days", 30)),
+                                                 step=1)
+        auto_clean_days = st.number_input("自动清理（天，0=禁用）", min_value=0,
+                                          max_value=3650,
+                                          value=int(dbc.get("auto_clean_days", 0)), step=10)
+
+        st.markdown("---")
+        st.markdown("**AI 筛选配置**")
+        st.caption("决定单次筛选喂给 AI 的数据量与返回上限。")
+        recent_days = st.number_input("取样时间窗口（天）", min_value=1, max_value=3650,
+                                      value=int(flt.get("recent_days", 60)), step=10)
+        max_apps = st.number_input("取样应用上限", min_value=1, max_value=2000,
+                                   value=int(flt.get("max_apps", 300)), step=10)
+        max_results = st.number_input("返回机会上限", min_value=1, max_value=100,
+                                      value=int(flt.get("max_results", 20)), step=1)
 
         c1, c2 = st.columns(2)
-        submitted = c1.form_submit_button("保存配置", use_container_width=True)
-        reset = c2.form_submit_button("重置为默认值", use_container_width=True)
+        submitted = c1.form_submit_button("保存配置", width="stretch")
+        reset = c2.form_submit_button("重置为默认值", width="stretch")
 
     if submitted:
         new_cfg = _config_from_form({
@@ -1492,7 +1420,10 @@ def _render_config_form(cfg):
             "max_keywords_per_benchmark": max_keywords_per_benchmark,
             "comment_pages": comment_pages,
             "filter_candidates_limit": filter_candidates_limit,
-            "enable_llm_filter": enable_llm_filter, "min_score": min_score,
+            "enable_llm_filter": enable_llm_filter,
+            "db_path": db_path, "refresh_threshold_days": refresh_threshold_days,
+            "auto_clean_days": auto_clean_days,
+            "recent_days": recent_days, "max_apps": max_apps, "max_results": max_results,
         })
         errors = validate_config(new_cfg)
         if errors:
@@ -1500,19 +1431,19 @@ def _render_config_form(cfg):
                 st.error(e)
         else:
             save_config(new_cfg)
-            st.session_state[MIN_SCORE_KEY] = float(min_score)
+            st.cache_data.clear()
             st.toast("配置已保存到 config.toml")
             st.rerun()
 
     if reset:
         save_config(DEFAULTS)
-        st.session_state.pop(MIN_SCORE_KEY, None)
+        st.cache_data.clear()
         st.toast("已重置为默认配置")
         st.rerun()
 
 
 def _render_artifacts(batch_id: str | None = None):
-    rows = _artifact_rows(batch_id)
+    rows = viewmodel.load_artifacts(_artifact_reader(batch_id))["rows"]
     parts = ['<div class="panel" style="padding:6px 0">']
     for r in rows:
         state = ('<span class="state ok"><span class="dot" aria-hidden="true"></span>已就绪</span>'
@@ -1521,7 +1452,7 @@ def _render_artifacts(batch_id: str | None = None):
         if r["ok"]:
             count = r["count"] if r["count"] is not None else "—"
             meta = f'{count} 条'
-            meta += f'<span style="margin-left:14px">{html.escape(_fmt_ts(r["ts"]))}</span>'
+            meta += f'<span style="margin-left:14px">{html.escape(viewmodel.fmt_ts(r["ts"]))}</span>'
         else:
             meta = html.escape(r["note"])
         parts.append(
@@ -1534,13 +1465,12 @@ def _render_artifacts(batch_id: str | None = None):
 
 
 def _render_traces_panel(traces, batch_id):
-    """结构化 Traces 检查器：卡片式列表 + 折叠详情。"""
     if batch_id and not traces:
         traces = store.load_traces(batch_id)
     if not traces:
         _empty_state("暂无 LLM 调用追踪",
                      "运行任一阶段后，每次大模型调用的 Prompt 与原始响应会在此展示。",
-                     "python -m radar audit")
+                     "python -m radar probe")
         return
     ok = sum(1 for t in traces if t.get("status") == "success")
     err = len(traces) - ok
@@ -1550,20 +1480,16 @@ def _render_traces_panel(traces, batch_id):
         f'累计 {total_s:.1f}s</div>',
         unsafe_allow_html=True,
     )
-    stage_filter = st.multiselect(
-        "按阶段过滤", sorted({str(t.get("stage") or "—") for t in traces}),
-        default=sorted({str(t.get("stage") or "—") for t in traces}),
-    )
+    stages = sorted({str(t.get("stage") or "—") for t in traces})
+    stage_filter = st.multiselect("按阶段过滤", stages, default=stages)
     shown = [t for t in traces if str(t.get("stage") or "—") in stage_filter]
     if not shown:
         st.info("当前过滤条件下无追踪记录。")
         return
-    st.markdown("".join(_trace_card(t, i) for i, t in enumerate(shown)),
-                unsafe_allow_html=True)
+    st.markdown("".join(_trace_card(t) for t in shown), unsafe_allow_html=True)
 
 
 def _render_text_log_panel(logs):
-    """纯文本详细模式：终端原味流式日志，支持下载与复制。"""
     text = "\n".join(logs) if logs else "暂无日志"
     st.markdown(
         f'<div class="logbox" role="log" aria-live="polite" aria-label="执行日志">'
@@ -1573,33 +1499,42 @@ def _render_text_log_panel(logs):
     if logs:
         c1, c2 = st.columns([1, 3])
         c1.download_button("下载日志", data="\n".join(logs), file_name="radar_run.log",
-                           mime="text/plain", use_container_width=True)
+                           mime="text/plain", width="stretch")
         with c2.popover("复制日志"):
             st.code("\n".join(logs), language="text")
 
 
-def render_console(cfg, opportunities):
-    st.markdown('<div class="panel-title">数据产物状态</div>', unsafe_allow_html=True)
+def render_pipeline(cfg, stats: dict):
+    completeness = viewmodel.completeness(
+        viewmodel.load_artifacts(_artifact_reader(None))["rows"], stats)
+    st.markdown(
+        f'<div class="muted">当前批次：<b>{html.escape(str(store.latest_run_id() or "—"))}</b>'
+        f' &nbsp; 完整度：{"完整" if completeness.get("complete") else "不完整"}'
+        f' &nbsp; 下一步：{html.escape(str(completeness.get("next_action", "—")))}</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown('<div class="panel-title" style="margin-top:12px">数据产物状态</div>',
+                unsafe_allow_html=True)
     _render_artifacts()
-    st.caption("所有产物均为 data/ 目录下的原子写入结果；界面读取最近一次成功产物。")
+    st.caption("所有产物均为 data/ 目录下的原子写入结果；数据库是跨批次累积的核心资产。")
 
     st.markdown('<div class="panel-title" style="margin-top:18px">流水线执行</div>',
                 unsafe_allow_html=True)
     disabled = _is_running()
     c1, c2, c3, c4 = st.columns(4)
-    if c1.button("全量扫描", disabled=disabled, use_container_width=True, key="c_full"):
+    if c1.button("全量扫描", disabled=disabled, width="stretch", key="c_full"):
         _start_run("全量扫描", "full")
         st.rerun()
-    if c2.button("仅捕获", disabled=disabled, use_container_width=True, key="c_cap"):
+    if c2.button("仅捕获", disabled=disabled, width="stretch", key="c_cap"):
         _start_run("仅捕获", "capture")
         st.rerun()
-    if c3.button("仅探测", disabled=disabled, use_container_width=True, key="c_prb"):
+    if c3.button("仅探测", disabled=disabled, width="stretch", key="c_prb"):
         _start_run("仅探测", "probe")
         st.rerun()
-    if c4.button("仅审计", disabled=disabled, use_container_width=True, key="c_aud"):
-        _start_run("仅审计", "audit")
+    if c4.button("AI 筛选", disabled=disabled, width="stretch", key="c_flt"):
+        _start_run("AI 筛选", "filter")
         st.rerun()
-    st.caption("全量扫描按 捕获 → 探测 → 审计 顺序执行；网络/LLM 临时故障会自动重试，"
+    st.caption("全量扫描按 捕获 → 探测 顺序执行；网络/LLM 临时故障会自动重试，"
                "仍失败则进入「中断」态，修正配置后可点「继续」从失败步骤恢复。")
 
     st.markdown('<div class="panel-title" style="margin-top:18px">执行日志</div>',
@@ -1622,10 +1557,34 @@ def render_console(cfg, opportunities):
 
 
 # --------------------------------------------------------------------------
-# 标签 5：提示词微调
+# 标签 4：历史批次 / 提示词
 # --------------------------------------------------------------------------
+def render_history():
+    batch_id = render_history_selector()
+    if not batch_id:
+        st.markdown('<div class="muted">当前展示 data/ 顶层镜像（最近一次成功批次）。</div>',
+                    unsafe_allow_html=True)
+        return
+    st.markdown(f'<div class="muted">正在回溯历史批次 <b>{html.escape(batch_id)}</b>。</div>',
+                unsafe_allow_html=True)
+    _render_artifacts(batch_id)
+    st.markdown('<div class="panel-title" style="margin-top:16px">LLM 调用追踪</div>',
+                unsafe_allow_html=True)
+    _render_traces_panel(store.load_traces(batch_id), batch_id)
+
+    result = store.load_run_json(batch_id, "filter_results.json")
+    if isinstance(result, dict) and result.get("opportunities"):
+        st.markdown('<div class="panel-title" style="margin-top:16px">该批次筛选结果</div>',
+                    unsafe_allow_html=True)
+        st.dataframe([{
+            "应用": o.get("name", ""),
+            "JTBD": _clip(o.get("jtbd"), 40),
+            "为什么选它": _clip(o.get("why_pick"), 80),
+            "切入点": _clip(o.get("attack_vector"), 60),
+        } for o in result["opportunities"]], width="stretch", hide_index=True)
+
+
 def _group_templates():
-    """按阶段分组模板名，供 UI 分区展示。"""
     groups: dict[str, list[str]] = {}
     for name, spec in prompts.PROMPT_TEMPLATES.items():
         groups.setdefault(spec["stage"], []).append(name)
@@ -1639,8 +1598,7 @@ def render_prompts():
         '「恢复官方默认」会删除自定义文件并回退到内建模板。</div>',
         unsafe_allow_html=True,
     )
-    if st.button("导出全部默认模板到 prompts/", use_container_width=False,
-                 disabled=_is_running()):
+    if st.button("导出全部默认模板到 prompts/", disabled=_is_running()):
         written = prompts.export_defaults(overwrite=False)
         st.toast(f"已导出 {len(written)} 个默认模板（不覆盖已有自定义文件）")
 
@@ -1661,13 +1619,12 @@ def _render_prompt_editor(name: str):
     ph = "".join(f'<span class="ph-chip">{{{p}}}</span>' for p in spec["placeholders"])
     st.markdown(
         f'<div class="prompt-head"><span class="prompt-name">{html.escape(spec["label"])}</span>'
-        f'<span class="muted">{html.escape(name)}.txt</span>{badge}</div>'
+        f'<span class="muted">{name}.txt</span>{badge}</div>'
         + (f'<div style="margin-bottom:6px">必要占位符: {ph}</div>' if spec["placeholders"] else ""),
         unsafe_allow_html=True,
     )
     widget_key = f"prompt_edit_{name}"
-    sync_key = f"{widget_key}_sync"
-    # 外部改动（保存/重置）后同步编辑器内容：必须在 text_area 实例化之前完成
+    sync_key = f"{PROMPT_SYNC_PREFIX}{name}"
     if st.session_state.get(sync_key) != current:
         st.session_state[widget_key] = current
         st.session_state[sync_key] = current
@@ -1675,11 +1632,8 @@ def _render_prompt_editor(name: str):
     text = st.text_area("模板内容", key=widget_key, height=200,
                         label_visibility="collapsed")
     c1, c2 = st.columns([1, 1])
-    save_clicked = c1.button("保存模板", key=f"save_{name}", use_container_width=True,
-                             disabled=_is_running())
-    reset_clicked = c2.button("恢复官方默认", key=f"reset_{name}", use_container_width=True,
-                              disabled=_is_running())
-    if save_clicked:
+    if c1.button("保存模板", key=f"save_{name}", width="stretch",
+                 disabled=_is_running()):
         errors = prompts.validate_prompt(name, text)
         if errors:
             for e in errors:
@@ -1689,7 +1643,8 @@ def _render_prompt_editor(name: str):
             st.session_state[sync_key] = text
             st.toast(f"{spec['label']} 已保存")
             st.rerun()
-    if reset_clicked:
+    if c2.button("恢复官方默认", key=f"reset_{name}", width="stretch",
+                 disabled=_is_running()):
         prompts.reset_prompt(name)
         st.session_state.pop(sync_key, None)
         st.toast(f"{spec['label']} 已恢复默认")
@@ -1705,70 +1660,30 @@ def main():
     _drain_queue()
 
     cfg = load_config()
-    min_score = sidebar_panel(cfg)
+    stats = _load_stats(cfg)
+    sidebar_panel(cfg, stats)
 
-    with st.container(key="history_bar"):
-        batch_id = render_history_selector()
-
-    feed, bench, probe, opps, audits, review, errors = _load_all(batch_id)
-    opportunities = (opps or {}).get("opportunities", []) if isinstance(opps, dict) else []
-    opp_meta = opps if isinstance(opps, dict) else None
-    audit_meta = audits if isinstance(audits, dict) else None
-    review_meta = review if isinstance(review, dict) else None
-
-    for err in errors:
-        st.error(err)
-    if batch_id:
-        st.markdown(
-            f'<div class="muted">正在回溯历史批次 <b>{html.escape(batch_id)}</b>；'
-            f'「最新」可返回 data/ 顶层镜像。</div>',
-            unsafe_allow_html=True,
-        )
-
-    render_brand(st.session_state[RUN_KEY], opp_meta, min_score, opportunities)
+    rows = viewmodel.load_artifacts(_artifact_reader(None))["rows"]
+    render_brand(st.session_state[RUN_KEY], stats, rows)
     render_run_strip()
     st.markdown("---")
 
-    t1, t2, t3, t_review, t4, t5 = st.tabs(
-        ["机会总览", "机会详情", "生态空白", "人工复核", "提示词微调", "控制台"])
+    t1, t2, t3, t4, t5 = st.tabs(
+        ["数据库", "AI 助手", "流水线", "历史批次", "提示词微调"])
 
     with t1:
-        if opps is None:
-            _empty_state("尚未审计", "先完成一次审计，或在侧栏触发全量扫描。",
-                         "python -m radar audit")
-        elif not opportunities:
-            _empty_state("已审计但无机会记录", "审计结果为空，检查前序产物后重新运行审计。",
-                         "python -m radar audit")
-        else:
-            render_kpi_row(opportunities, min_score, audit_meta, review_meta, probe)
-            st.markdown("")
-            render_ladder(opportunities, min_score)
-            render_report_section(opp_meta, batch_id)
-
+        render_database(cfg, stats)
     with t2:
-        if not opportunities:
-            _empty_state("暂无可查看的机会", "先完成一次审计，或在总览页调整门槛。",
-                         "python -m radar audit")
-        else:
-            render_details(opportunities, min_score)
-
+        render_filter_page(cfg, stats)
     with t3:
-        if not opportunities:
-            _empty_state("暂无可查看的生态空白", "先完成一次审计。", "python -m radar audit")
-        else:
-            render_ecosystem(opportunities, min_score)
-
-    with t_review:
-        render_review_queue(review_meta, audit_meta)
-
+        render_pipeline(cfg, stats)
     with t4:
+        render_history()
+    with t5:
         render_prompts()
 
-    with t5:
-        render_console(cfg, opportunities)
-
     st.sidebar.markdown("---")
-    st.sidebar.caption("Harmony Opportunity Radar · M4 情报看板")
+    st.sidebar.caption("Harmony Opportunity Radar · M5 数据资产 + 按需筛选")
 
 
 if __name__ == "__main__":

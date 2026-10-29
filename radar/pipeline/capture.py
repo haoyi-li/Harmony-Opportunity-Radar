@@ -8,7 +8,7 @@
 import json
 from datetime import datetime, timezone
 
-from radar import store, telemetry
+from radar import database, store, telemetry
 from radar.llm import LLMClient, LLMError
 from radar.pipeline import PipelineAbortError, RetryableAbortError
 from radar.prompts import CAPTURE_SYSTEM, CAPTURE_USER
@@ -24,7 +24,9 @@ def run(cfg: dict) -> int:
     # ---- 第 1 步: 拉取 Apple 榜单原始数据 ----
     print("[1/3] 拉取 Apple RSS 榜单 "
           f"({','.join(cap_cfg['regions'])} × {','.join(cap_cfg['charts'])}) ...")
-    telemetry.current() and telemetry.current().stage_start(STAGE, 1, "榜单捕获")
+    tel = telemetry.current()
+    if tel is not None:
+        tel.stage_start(STAGE, 1, "榜单捕获")
     telemetry.progress(STAGE, 0, message="拉取 Apple RSS 榜单…")
     apps = apple_rss.fetch_all(
         regions=cap_cfg["regions"],
@@ -102,8 +104,9 @@ def run(cfg: dict) -> int:
         raise PipelineAbortError(
             "LLM 选择均无法与原始榜单匹配，触发熔断：保留历史 benchmarks.json 不被覆盖。")
 
+    captured_at = _now()
     store.save_benchmarks({
-        "captured_at": _now(),
+        "captured_at": captured_at,
         "model": cfg["llm"]["model"],
         "count": len(benchmarks),
         "capture_stats": {
@@ -115,10 +118,35 @@ def run(cfg: dict) -> int:
         },
         "benchmarks": benchmarks,
     })
+
+    # ---- 写入本地增量数据库（失败不影响 JSON 产物）----
+    db_count, db_error = _persist_to_database(cfg, benchmarks, captured_at)
     print(f"[3/3] 完成！精选 {len(benchmarks)} 个标杆，已存 benchmarks.json")
-    if telemetry.current():
-        telemetry.current().stage_done(STAGE, f"精选 {len(benchmarks)} 个标杆")
+    if db_error:
+        print(f"      [warn] 数据库写入失败：{db_error}（JSON 产物仍有效）")
+    elif db_count:
+        print(f"      已写入本地数据库：{db_count} 个应用新增或刷新")
+    if tel is not None:
+        tel.stage_done(STAGE, f"精选 {len(benchmarks)} 个标杆")
     return len(benchmarks)
+
+
+def _persist_to_database(cfg: dict, benchmarks: list[dict],
+                         seen_at: str) -> tuple[int, str]:
+    """把精选标杆写入 SQLite apps 表，返回（入库条数, 错误信息）。"""
+    try:
+        db_path = database.resolve_db_path(cfg)
+        database.init_db(db_path)
+        count = database.upsert_benchmarks(benchmarks, db_path=db_path, seen_at=seen_at)
+        database.mark_needs_refresh(
+            int((cfg.get("database") or {}).get("refresh_threshold_days", 30)),
+            db_path=db_path)
+        auto_clean = int((cfg.get("database") or {}).get("auto_clean_days", 0) or 0)
+        if auto_clean > 0:
+            database.clean_old_apps(auto_clean, db_path=db_path)
+        return count, ""
+    except Exception as e:
+        return 0, str(e)
 
 
 def _build_identity_index(apps: list[dict]) -> tuple[dict, dict]:

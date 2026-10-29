@@ -5,10 +5,11 @@
 用法:
     .\run.ps1                 交互菜单
     .\run.ps1 gui             启动 Web 情报看板
-    .\run.ps1 full            全量流水线 capture -> probe -> audit
+    .\run.ps1 full            全量流水线 capture -> probe
     .\run.ps1 capture         仅捕获 Apple 榜单
     .\run.ps1 probe           仅探测鸿蒙供给
-    .\run.ps1 audit           仅四维审计
+    .\run.ps1 filter          AI 事后筛选（按需）
+    .\run.ps1 db-stats        查看数据库统计
     .\run.ps1 check           环境自检
     .\run.ps1 install         安装依赖
 
@@ -72,7 +73,7 @@ function Invoke-Check {
         Write-Host "  [i] config.toml 缺失，将使用内置默认值" -ForegroundColor Yellow
     }
 
-    foreach ($f in @("raw_feed.json", "benchmarks.json", "probe.json", "opportunities.json")) {
+    foreach ($f in @("raw_feed.json", "benchmarks.json", "probe.json", "filter_results.json")) {
         $p = Join-Path $Root "data\$f"
         if (Test-Path $p) {
             $kb = [math]::Round((Get-Item $p).Length / 1KB, 1)
@@ -88,12 +89,13 @@ function Show-Menu {
     Write-Host ""
     Write-Host "纯血鸿蒙机会雷达 · 快速运行" -ForegroundColor Cyan
     Write-Host "  1) 启动 Web 情报看板 (gui)"
-    Write-Host "  2) 全量流水线 (capture -> probe -> audit)"
+    Write-Host "  2) 全量流水线 (capture -> probe)"
     Write-Host "  3) 仅捕获 (capture)"
     Write-Host "  4) 仅探测 (probe)"
-    Write-Host "  5) 仅审计 (audit)"
-    Write-Host "  6) 环境自检 (check)"
-    Write-Host "  7) 安装依赖 (install)"
+    Write-Host "  5) AI 事后筛选 (filter)"
+    Write-Host "  6) 数据库统计 (db-stats)"
+    Write-Host "  7) 环境自检 (check)"
+    Write-Host "  8) 安装依赖 (install)"
     Write-Host "  0) 退出"
     $choice = Read-Host "请输入序号"
     switch ($choice) {
@@ -101,9 +103,10 @@ function Show-Menu {
         "2" { return "full" }
         "3" { return "capture" }
         "4" { return "probe" }
-        "5" { return "audit" }
-        "6" { return "check" }
-        "7" { return "install" }
+        "5" { return "filter" }
+        "6" { return "db-stats" }
+        "7" { return "check" }
+        "8" { return "install" }
         default { return "" }
     }
 }
@@ -127,7 +130,7 @@ switch ($Action.ToLower()) {
     "full" {
         # 全量扫描共享同一批次目录，便于统一回溯
         $batchId = Get-Date -Format "yyyyMMdd_HHmmss"
-        foreach ($step in @(@("capture", "榜单捕获"), @("probe", "供给探测"), @("audit", "四维审计"))) {
+        foreach ($step in @(@("capture", "榜单捕获"), @("probe", "供给探测"))) {
             Invoke-Radar -Label $step[1] -RadarArgs @($step[0], "--batch-id", $batchId)
             if ($script:RadarExit -ne 0) { exit $script:RadarExit }
         }
@@ -143,8 +146,12 @@ switch ($Action.ToLower()) {
         Invoke-Radar -Label "供给探测" -RadarArgs @("probe")
         exit $script:RadarExit
     }
-    "audit" {
-        Invoke-Radar -Label "四维审计" -RadarArgs @("audit")
+    "filter" {
+        Invoke-Radar -Label "AI 筛选" -RadarArgs @("filter")
+        exit $script:RadarExit
+    }
+    "db-stats" {
+        Invoke-Radar -Label "数据库统计" -RadarArgs @("database", "stats")
         exit $script:RadarExit
     }
     "check" { Invoke-Check; exit 0 }
@@ -155,7 +162,7 @@ switch ($Action.ToLower()) {
     }
     default {
         Write-Host "未知指令: $Action" -ForegroundColor Red
-        Write-Host "可用: gui | full | capture | probe | audit | check | install"
+        Write-Host "可用: gui | full | capture | probe | filter | db-stats | check | install"
         exit 1
     }
 }
