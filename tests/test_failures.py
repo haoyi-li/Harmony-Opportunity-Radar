@@ -58,6 +58,7 @@ class CaptureFailureTest(unittest.TestCase):
 
         with mock.patch.object(capture.apple_rss, "fetch_all", return_value=apps), \
                 mock.patch.object(capture, "LLMClient", EmptyLLM), \
+                mock.patch.object(capture.store, "save_raw_feed"), \
                 mock.patch.object(capture.store, "save_benchmarks") as save:
             with self.assertRaises(PipelineAbortError):
                 capture.run(self._cfg())
