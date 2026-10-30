@@ -46,10 +46,10 @@ Copy-Item config.example.toml config.toml
 关键配置项：
 
 - `[llm] base_url / api_key / model / timeout`
-- `[capture] regions / charts / feed_limit / max_benchmarks / llm_input_limit`
+- `[capture] regions / charts / feed_limit / max_benchmarks / llm_input_limit / enrich_itunes`
 - `[probe] max_comments_per_app / bad_rating_threshold / max_competitors`
-- `[database] path / refresh_threshold_days / auto_clean_days`
-- `[filter] recent_days / max_apps / max_results`
+- `[database] path / decisions_path / refresh_threshold_days / auto_clean_days`
+- `[filter] max_apps / batch_size / verdict_ttl_days / enable_criteria_hash`
 
 ## 运行
 
@@ -82,6 +82,7 @@ python -m radar database init      # 初始化（幂等）
 python -m radar database stats     # 统计概览
 python -m radar database refresh   # 列出待刷新应用
 python -m radar database export    # 导出 CSV
+python -m radar database validate --idea "Markdown 笔记" --json  # 验证产品创意
 python -m radar database clean --days 90
 ```
 
@@ -89,19 +90,23 @@ python -m radar database clean --days 90
 
 所有中间产物位于 `data/` 下，写入采用临时文件 + `os.replace` 原子替换。`data/` 已被 `.gitignore` 排除。
 
-- `data/apps.db`：**SQLite 增量数据库（核心资产）**，三张表 `apps` / `competitors` / `reviews`，WAL 模式
+- `data/apps.db`：**原始仓库（核心资产）**，`apps` / `app_snapshots` / `competitors` / `reviews`，WAL 模式
+- `data/decisions.db`：**筛选产物库**，`app_verdicts` / `filter_runs` / `knowledge_patterns`
 - `data/runs/<batch_id>/`：批次隔离目录
 - `data/runs/<batch_id>/llm_traces.jsonl`：结构化 LLM 调用记录
 - `data/benchmarks.json`、`data/probe.json`：最近一次批次的镜像产物
-- `data/filter_results.json`：最近一次 AI 筛选结果
+- `data/filter_results.json`：累计最新 accept 结果（供 WebUI 与导出）
 
 数据库表结构要点：
 
 | 表 | 内容 |
 |---|---|
-| `apps` | 应用基础信息 + `first_seen` / `last_seen` / `capture_count` / `last_probe_at` / `is_blank` / `needs_refresh` / `is_favorite` |
+| `apps` | 目录层全量应用 + iTunes 详情 + 榜单覆盖/最佳排名 + 标杆标记 |
+| `app_snapshots` | 评分 / 评论数 / 排名变化快照（仅变化时追加） |
 | `competitors` | 每轮 probe 的竞品快照（评分、下载、评论证据、`probed_at`），按轮次追加 |
 | `reviews` | LLM 提炼的差评痛点（issue / frequency / quote），关联到竞品 |
+| `app_verdicts` | 逐应用 accept/reject 裁决（含依据快照、模型、批次、TTL） |
+| `filter_runs` | 每次筛选的输入 / 入选 / 拒绝 / 缓存命中计数 |
 
 ## WebUI
 

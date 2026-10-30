@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """故障注入测试：网络/LLM/格式故障时保留历史产物，不写空覆盖。"""
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from radar.pipeline import PipelineAbortError, RetryableAbortError
@@ -8,12 +10,19 @@ from radar.pipeline import capture, filter as filter_stage, probe
 
 
 class CaptureFailureTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = str(Path(self.tmp.name) / "apps.db")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
     def _cfg(self):
         return {"llm": {"model": "m", "base_url": "http://x"},
                 "capture": {"regions": ["cn"], "charts": ["top-free"],
                             "feed_limit": 10, "max_benchmarks": 5,
-                            "llm_input_limit": 200},
-                "database": {"path": "data/apps.db"}}
+                            "llm_input_limit": 200, "enrich_itunes": False},
+                "database": {"path": self.db}}
 
     def test_all_apple_feeds_fail_is_retryable(self):
         with mock.patch.object(capture.apple_rss, "fetch_all", return_value=[]):
@@ -44,6 +53,9 @@ class CaptureFailureTest(unittest.TestCase):
         # 原始快照已落盘（便于重跑），但绝不写空 benchmarks
         self.assertIn("raw", saved)
         self.assertNotIn("bench", saved)
+        # 目录层在 LLM 失败前已入库，避免白跑一轮网络抓取
+        from radar import database
+        self.assertIsNotNone(database.get_app_detail("1", self.db))
 
     def test_empty_llm_selection_triggers_abort(self):
         apps = [{"name": "A", "artist": "X", "apple_id": "1", "rank": 1,
@@ -101,16 +113,24 @@ class ProbeFailureTest(unittest.TestCase):
 
 
 class FilterFailureTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = str(Path(self.tmp.name) / "apps.db")
+        self.dec = str(Path(self.tmp.name) / "decisions.db")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
     def _cfg(self):
         return {"llm": {"model": "m", "base_url": "http://x"},
-                "database": {"path": "data/apps.db"},
-                "filter": {"recent_days": 60, "max_apps": 300, "max_results": 20}}
+                "database": {"path": self.db, "decisions_path": self.dec},
+                "filter": {"max_apps": 300, "batch_size": 50,
+                           "verdict_ttl_days": 90}}
 
-    def test_empty_database_aborts(self):
-        with mock.patch.object(filter_stage.database, "apps_for_filter",
+    def test_no_pending_apps_returns_zero_without_llm(self):
+        with mock.patch.object(filter_stage.database, "apps_needing_verdict",
                                return_value=[]):
-            with self.assertRaises(PipelineAbortError):
-                filter_stage.run(self._cfg())
+            self.assertEqual(filter_stage.run(self._cfg()), 0)
 
     def test_llm_failure_is_retryable(self):
         from radar.llm import LLMError
@@ -122,9 +142,12 @@ class FilterFailureTest(unittest.TestCase):
             def chat_json(self, *a, **k):
                 raise LLMError("down")
 
-        with mock.patch.object(filter_stage.database, "apps_for_filter",
-                               return_value=[{"apple_id": "1", "name": "A"}]), \
-                mock.patch.object(filter_stage, "LLMClient", BoomLLM):
+        with mock.patch.object(
+                filter_stage.database, "apps_needing_verdict",
+                return_value=[{"apple_id": "1", "name": "A",
+                               "metrics_version": 1}]), \
+                mock.patch.object(filter_stage, "LLMClient", BoomLLM), \
+                mock.patch.object(filter_stage.store, "save_filter_results"):
             with self.assertRaises(RetryableAbortError):
                 filter_stage.run(self._cfg())
 
@@ -137,8 +160,10 @@ class FilterFailureTest(unittest.TestCase):
                 return []
 
         saved = []
-        with mock.patch.object(filter_stage.database, "apps_for_filter",
-                               return_value=[{"apple_id": "1", "name": "A"}]), \
+        with mock.patch.object(
+                filter_stage.database, "apps_needing_verdict",
+                return_value=[{"apple_id": "1", "name": "A",
+                               "metrics_version": 1}]), \
                 mock.patch.object(filter_stage, "LLMClient", EmptyLLM), \
                 mock.patch.object(filter_stage.store, "save_filter_results",
                                   side_effect=lambda d: saved.append(d)):

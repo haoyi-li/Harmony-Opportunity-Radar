@@ -25,10 +25,11 @@ DEFAULTS = {
     "capture": {
         "regions": ["cn", "us"],
         "charts": ["top-free", "top-paid"],
-        "feed_limit": 100,
+        "feed_limit": 200,
         "max_benchmarks": 20,
         "llm_input_limit": 200,
         "rss_retries": 3,
+        "enrich_itunes": True,
     },
     "probe": {
         "max_comments_per_app": 50,
@@ -41,13 +42,15 @@ DEFAULTS = {
     },
     "database": {
         "path": "data/apps.db",
+        "decisions_path": "data/decisions.db",
         "refresh_threshold_days": 30,
         "auto_clean_days": 0,
     },
     "filter": {
-        "recent_days": 60,
         "max_apps": 300,
-        "max_results": 20,
+        "batch_size": 50,
+        "verdict_ttl_days": 90,
+        "enable_criteria_hash": False,
     },
 }
 
@@ -125,18 +128,20 @@ def validate_config(cfg: dict) -> list[str]:
     db = cfg.get("database") or {}
     if not str(db.get("path", "") or "").strip():
         errors.append("数据库配置：路径不能为空。")
+    if not str(db.get("decisions_path", "") or "").strip():
+        errors.append("数据库配置：产物库路径不能为空。")
     errors += _check_number_range("数据库配置：刷新阈值(天)",
                                   db.get("refresh_threshold_days"), 1, 3650)
     errors += _check_number_range("数据库配置：自动清理(天)",
                                   db.get("auto_clean_days"), 0, 3650)
 
     flt = cfg.get("filter") or {}
-    errors += _check_number_range("AI 筛选配置：取样时间窗口(天)",
-                                  flt.get("recent_days"), 1, 3650)
-    errors += _check_number_range("AI 筛选配置：取样应用上限",
-                                  flt.get("max_apps"), 1, 2000)
-    errors += _check_number_range("AI 筛选配置：结果上限",
-                                  flt.get("max_results"), 1, 100)
+    errors += _check_number_range("AI 筛选配置：单次应用上限",
+                                  flt.get("max_apps"), 1, 5000)
+    errors += _check_number_range("AI 筛选配置：单批应用数",
+                                  flt.get("batch_size"), 1, 200)
+    errors += _check_number_range("AI 筛选配置：裁决有效期(天)",
+                                  flt.get("verdict_ttl_days"), 1, 3650)
 
     return errors
 

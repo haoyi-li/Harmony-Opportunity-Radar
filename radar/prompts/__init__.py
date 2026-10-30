@@ -163,20 +163,25 @@ _PROBE_PAIN_USER = """以下是从华为应用市场抓取的真实低分用户�
 
 只输出 JSON 对象本身；pain_points 没有内容时必须为空数组。"""
 
-_USER_FILTER_SYSTEM = """你是独立开发者的应用机会筛选助理。你的任务是通读用户的应用数据库，按用户写明的标准挑出真正值得做的方向，并说明理由。
+_USER_FILTER_SYSTEM = """你是独立开发者的应用机会筛选助理。你的任务是逐个审阅输入的应用，按用户写明的标准判断它是否值得做，并给出可复核的理由。
+
+{historical_context}
 
 事实纪律（严格执行）：
-- 只能使用输入数据库中的事实：应用名、JTBD、入选理由、榜单来源、竞品数量与评分、差评痛点原文。
+- 只能使用输入数据库中的事实：应用名、JTBD、入选理由、榜单来源、iTunes 评分与评论数、竞品数量与评分、差评痛点原文。
 - 禁止虚构下载量、收入、评分趋势、用户规模、功能细节或鸿蒙平台能力；未知信息不得当作不存在。
 - 「生态空白」只代表最近一次检索未发现同类竞品，属于待验证假设，不得表述为全市场结论。
 - attack_vector 必须对应输入中真实出现的差评痛点或检索空白；没有证据时写「待验证」。
 - 不得因为应用没被 probe 过就判定它没有机会，只能标注「尚未验证供给」。
+- 目录层应用可能只有 Apple 侧事实；这类应用可以 accept，但理由里必须说明供给尚未验证。
 
 输出纪律：
 - 只输出合法 JSON 数组，不要 Markdown、解释、注释或尾随逗号。
-- 数组元素必须包含 name、apple_id、jtbd、why_pick、attack_vector、native_features、competitors_summary 七个字段。
-- 按你判断的潜力从高到低排序，数量不超过用户消息中的上限。
-- 没有符合条件的应用时返回空数组。"""
+- 数组必须包含输入的**每一个应用**，每个应用恰好一条裁决，按潜力从高到低排序。
+- 每个元素必须包含 apple_id、name、verdict、score、reason、attack_vector、native_features、competitors_summary 八个字段。
+- verdict 只能是 "accept" 或 "reject"。accept 时 score（0-100）、attack_vector、native_features 必填；reject 时 score/attack_vector/native_features 可为空，但 reason 必填。
+- reason 用一句话说明「为什么接受/拒绝」，必须能追溯到输入中的具体事实。
+- 不允许遗漏输入中的应用；确实无法判断时输出 reject 并在 reason 中写明证据不足。"""
 
 _USER_FILTER = """你是我的个人应用机会筛选助理。
 
@@ -204,16 +209,17 @@ _USER_FILTER = """你是我的个人应用机会筛选助理。
 {database_json}
 
 输出要求：
-按你认为最有潜力的顺序（综合考虑：需求验证、开发可行性、竞争态势、原生能力契合度），返回最多 {max_results} 个机会。
+对输入中的**每一个应用**给出裁决，按你认为最有潜力的顺序排序。不要遗漏任何应用。
 
 JSON 格式：
 [
   {{
+    "apple_id": "Apple ID（原样回填）",
     "name": "应用名",
-    "apple_id": "Apple ID",
-    "jtbd": "用户任务",
-    "why_pick": "为什么适合我（2-3句话，说明需求验证 + 开发可行性 + 原生能力）",
-    "attack_vector": "主要切入点（生态空白 或 竞品具体痛点）",
+    "verdict": "accept 或 reject",
+    "score": 85,
+    "reason": "一句话理由，必须引用输入中的事实",
+    "attack_vector": "主要切入点（生态空白 或 竞品具体痛点）；reject 时可为空",
     "native_features": ["推荐的鸿蒙能力1", "推荐的鸿蒙能力2"],
     "competitors_summary": "华为竞品概况（数量/评分/主要痛点，1句话）"
   }}
@@ -236,9 +242,9 @@ PROMPT_TEMPLATES: dict[str, dict] = {
     "probe_pain_user": _spec("差评痛点提炼 · User", "M2 probe", "user", _PROBE_PAIN_USER,
                              ["reviews_json"]),
     "user_filter_system": _spec("机会筛选 · System", "AI filter", "system",
-                                _USER_FILTER_SYSTEM),
+                                _USER_FILTER_SYSTEM, ["historical_context"]),
     "user_filter": _spec("机会筛选 · User", "AI filter", "user", _USER_FILTER,
-                         ["database_json", "max_results"]),
+                         ["database_json"]),
 }
 
 # 真实占位符：单花括号 {name}；`{{`/`}}` 是 .format() 的字面量转义，不算占位符

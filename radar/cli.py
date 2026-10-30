@@ -13,6 +13,7 @@ M4 版本化与熔断：
   且绝不覆写 data/ 顶层的有效历史产物。
 """
 import argparse
+import json
 import subprocess
 import sys
 
@@ -68,6 +69,16 @@ def _build_parser():
     db_sub.add_parser("export", help="导出应用清单为 CSV")
     db_sub.add_parser("import", help="从现有 benchmarks/probe JSON 回填数据库")
 
+    validate = db_sub.add_parser(
+        "validate", help="验证产品创意（查询 Apple 标杆与华为竞品事实）")
+    validate.add_argument("--idea", required=True,
+                          help="产品关键词，如 'Markdown 笔记'")
+    validate.add_argument("--genre", default=None,
+                          help="可选类别过滤（iTunes genre，如 Productivity）")
+    validate.add_argument("--output", default=None, help="导出为 JSON 文件")
+    validate.add_argument("--json", action="store_true",
+                          help="输出 JSON 到 stdout（供外部 agent 捕获）")
+
     clean = db_sub.add_parser("clean", help="清理长期未出现的应用")
     clean.add_argument("--days", type=int, default=90,
                        help="删除超过 N 天未出现的应用（默认 90）")
@@ -119,6 +130,49 @@ def _run_stage(stage: str, label: str, cfg: dict, batch_id: str | None,
     return n
 
 
+def _print_idea_validation(result: dict) -> None:
+    """把 validate_idea 的结构化事实渲染为终端友好格式。"""
+    query = result.get("query", "")
+    found = result.get("found_benchmarks") or []
+    if not found:
+        print(result.get("message") or result.get("error") or "未找到相关应用。")
+        return
+    stats = result.get("summary_stats") or {}
+    print(f"查询: {query}")
+    print(f"匹配标杆: {stats.get('total_benchmarks', len(found))} 个"
+          f"（生态空白 {stats.get('blank_count', 0)} 个，"
+          f"高频痛点标杆 {stats.get('high_pain_benchmarks', 0)} 个）")
+    for idx, item in enumerate(found, 1):
+        apple = item.get("apple") or {}
+        huawei = item.get("huawei") or {}
+        rating = apple.get("avg_rating")
+        count = apple.get("rating_count")
+        rank = apple.get("best_rank")
+        meta = " | ".join(x for x in (
+            apple.get("genre") or "",
+            f"{rating} 分" if isinstance(rating, (int, float)) else "",
+            f"{count} 条评价" if count is not None else "",
+            f"最佳排名 {rank}" if rank is not None else "",
+        ) if x)
+        print(f"\n{idx}. {apple.get('name', '?')}  {meta}")
+        if apple.get("url"):
+            print(f"   {apple['url']}")
+        if huawei.get("is_blank"):
+            print("   华为侧：本次检索未发现同类竞品（待验证假设）")
+            continue
+        comps = huawei.get("competitors") or []
+        print(f"   华为侧：{huawei.get('competitor_count', len(comps))} 个竞品"
+              f"（probe {huawei.get('latest_probe_at', '—')}）")
+        for comp in comps:
+            pains = [p.get("issue", "") for p in
+                     (comp.get("high_freq_pains") or []) +
+                     (comp.get("mid_freq_pains") or []) if p.get("issue")]
+            pain_txt = "；".join(pains) if pains else "无结构化痛点"
+            print(f"   - {comp.get('name', '?')} "
+                  f"(评分 {comp.get('rating', '—')}, {comp.get('downloads', '—')})"
+                  f"：{pain_txt}")
+
+
 def _database_command(args, cfg: dict) -> int:
     db_path = database.resolve_db_path(cfg)
     cmd = args.db_command
@@ -131,6 +185,8 @@ def _database_command(args, cfg: dict) -> int:
         stats = database.get_stats(db_path)
         print(f"数据库: {db_path}")
         print(f"  应用总数     : {stats['total']}")
+        print(f"    标杆 / 目录 : {stats.get('benchmarks', 0)} / {stats.get('catalog', 0)}")
+        print(f"  指标快照     : {stats.get('snapshots', 0)} 条")
         print(f"  最近 7 天新增: {stats['new_7']}")
         print(f"  最近 30 天新增: {stats['new_30']}")
         print(f"  已 probe     : {stats['probed']}（其中空白 {stats['blank']}）")
@@ -162,6 +218,23 @@ def _database_command(args, cfg: dict) -> int:
         result = database.import_from_artifacts(store.load_benchmarks(),
                                                 store.load_probe(), db_path=db_path)
         print(f"已回填数据库 {path}: 应用 {result['apps']} 条，探测状态 {result['probed']} 条")
+        return EXIT_OK
+    if cmd == "validate":
+        path = database.init_db(db_path)
+        keywords = args.idea
+        genre = getattr(args, "genre", None)
+        output = getattr(args, "output", None)
+        as_json = bool(getattr(args, "json", False))
+        if output:
+            out = database.export_idea_validation(
+                keywords, output_path=output, genre=genre, db_path=path)
+            print(f"已导出到: {out}")
+            return EXIT_OK
+        result = database.validate_idea(keywords, genre=genre, db_path=path)
+        if as_json:
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        else:
+            _print_idea_validation(result)
         return EXIT_OK
     if cmd == "clean":
         database.init_db(db_path)

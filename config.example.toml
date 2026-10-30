@@ -14,10 +14,11 @@ timeout  = 120                          # 秒，本地大模型响应偏慢，�
 # ---- Apple 标杆捕获（M1）----
 regions = ["cn", "us"]              # 拉哪些地区的榜单
 charts  = ["top-free", "top-paid"]  # 拉哪些榜单类型
-feed_limit = 100                     # 每个榜单拉取条数（上限 200）
+feed_limit = 200                     # 每个榜单拉取条数（上限 200，全量目录入库）
 max_benchmarks = 20                  # LLM 精选后保留的标杆数量上限
 llm_input_limit = 200                # 送入 LLM 的应用条数上限
 rss_retries = 3                      # RSS 拉取重试次数
+enrich_itunes = true                 # 用 iTunes lookup 补齐 genre/评分/描述等详情
 
 [probe]
 # ---- 鸿蒙供给探测（M2）----
@@ -31,12 +32,14 @@ enable_llm_filter = true             # 关闭则退化为按下载量/评分排�
 
 [database]
 # ---- 本地增量数据库（核心数据资产）----
-path = "data/apps.db"                # SQLite 路径（相对项目根目录）
+path = "data/apps.db"                # 原始仓库：capture / probe 写入
+decisions_path = "data/decisions.db" # 产物库：filter 裁决与知识模式
 refresh_threshold_days = 30          # 超过 N 天未 probe 标记为「待刷新」
 auto_clean_days = 0                  # 自动清理 N 天未出现的应用（0=禁用）
 
 [filter]
-# ---- AI 事后筛选（按需调用，不做预先打分）----
-recent_days = 60                     # 只把最近 N 天出现过的应用喂给 AI
-max_apps = 300                       # 单次筛选送入 LLM 的应用上限
-max_results = 20                     # AI 最多返回多少个候选机会
+# ---- AI 增量筛选（只裁决未分析或依据失效的应用）----
+max_apps = 300                       # 单次最多处理多少个待裁决应用
+batch_size = 50                      # 每次 LLM 调用包含多少个应用
+verdict_ttl_days = 90                # 裁决兜底有效期（天）
+enable_criteria_hash = false         # 提示词/模型变化时是否强制重判

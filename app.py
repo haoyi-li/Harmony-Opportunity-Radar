@@ -1245,9 +1245,9 @@ def render_filter_page(cfg: dict, stats: dict):
                 unsafe_allow_html=True)
     filter_cfg = cfg.get("filter") or {}
     st.markdown(
-        f'<div class="muted">取样范围：最近 {filter_cfg.get("recent_days", 60)} 天出现、'
-        f'最多 {filter_cfg.get("max_apps", 300)} 个应用；输出上限 '
-        f'{filter_cfg.get("max_results", 20)} 个机会。可在「流水线 → 配置」调整。</div>',
+        f'<div class="muted">增量裁决：只处理尚未分析或 probe 依据已更新的应用，'
+        f'单次最多 {filter_cfg.get("max_apps", 300)} 个、每批 {filter_cfg.get("batch_size", 50)} 个。'
+        f'已裁决的应用（含 reject）会命中缓存，不再重复调用 LLM。</div>',
         unsafe_allow_html=True,
     )
     c1, c2 = st.columns([1, 3])
@@ -1309,6 +1309,7 @@ def _config_from_form(form):
             "max_benchmarks": int(form["max_benchmarks"]),
             "llm_input_limit": int(form["llm_input_limit"]),
             "rss_retries": int(form["rss_retries"]),
+            "enrich_itunes": bool(form["enrich_itunes"]),
         },
         "probe": {
             "max_comments_per_app": int(form["max_comments_per_app"]),
@@ -1321,13 +1322,15 @@ def _config_from_form(form):
         },
         "database": {
             "path": form["db_path"].strip(),
+            "decisions_path": form["decisions_db_path"].strip(),
             "refresh_threshold_days": int(form["refresh_threshold_days"]),
             "auto_clean_days": int(form["auto_clean_days"]),
         },
         "filter": {
-            "recent_days": int(form["recent_days"]),
             "max_apps": int(form["max_apps"]),
-            "max_results": int(form["max_results"]),
+            "batch_size": int(form["batch_size"]),
+            "verdict_ttl_days": int(form["verdict_ttl_days"]),
+            "enable_criteria_hash": bool(form["enable_criteria_hash"]),
         },
     }
 
@@ -1356,13 +1359,15 @@ def _render_config_form(cfg):
         charts = st.multiselect("榜单", ["top-free", "top-paid"],
                                 default=cap.get("charts", ["top-free", "top-paid"]))
         feed_limit = st.number_input("RSS 榜单条数", min_value=1, max_value=200,
-                                     value=int(cap.get("feed_limit", 100)), step=10)
+                                     value=int(cap.get("feed_limit", 200)), step=10)
         max_benchmarks = st.number_input("精选标杆上限", min_value=1, max_value=100,
                                          value=int(cap.get("max_benchmarks", 20)), step=1)
         llm_input_limit = st.number_input("LLM 输入上限", min_value=1, max_value=500,
                                           value=int(cap.get("llm_input_limit", 200)), step=10)
         rss_retries = st.number_input("RSS 拉取重试次数", min_value=1, max_value=10,
                                       value=int(cap.get("rss_retries", 3)), step=1)
+        enrich_itunes = st.checkbox("用 iTunes 补齐目录详情（评分/描述/类别）",
+                                    value=bool(cap.get("enrich_itunes", True)))
 
         st.markdown("---")
         st.markdown("**华为探测配置**")
@@ -1386,7 +1391,9 @@ def _render_config_form(cfg):
         st.markdown("---")
         st.markdown("**本地数据库配置**")
         st.caption("数据库只增不减；超过阈值未 probe 的应用会被标记为待刷新。")
-        db_path = st.text_input("数据库路径", value=str(dbc.get("path", "data/apps.db")))
+        db_path = st.text_input("原始仓库路径", value=str(dbc.get("path", "data/apps.db")))
+        decisions_db_path = st.text_input(
+            "产物库路径", value=str(dbc.get("decisions_path", "data/decisions.db")))
         refresh_threshold_days = st.number_input("待刷新阈值（天）", min_value=1,
                                                  max_value=3650,
                                                  value=int(dbc.get("refresh_threshold_days", 30)),
@@ -1397,13 +1404,16 @@ def _render_config_form(cfg):
 
         st.markdown("---")
         st.markdown("**AI 筛选配置**")
-        st.caption("决定单次筛选喂给 AI 的数据量与返回上限。")
-        recent_days = st.number_input("取样时间窗口（天）", min_value=1, max_value=3650,
-                                      value=int(flt.get("recent_days", 60)), step=10)
-        max_apps = st.number_input("取样应用上限", min_value=1, max_value=2000,
+        st.caption("增量裁决：只处理未分析或依据失效的应用；reject 也会入库避免重复分析。")
+        max_apps = st.number_input("单次处理应用上限", min_value=1, max_value=5000,
                                    value=int(flt.get("max_apps", 300)), step=10)
-        max_results = st.number_input("返回机会上限", min_value=1, max_value=100,
-                                      value=int(flt.get("max_results", 20)), step=1)
+        batch_size = st.number_input("单批应用数", min_value=1, max_value=200,
+                                     value=int(flt.get("batch_size", 50)), step=10)
+        verdict_ttl_days = st.number_input("裁决有效期（天）", min_value=1, max_value=3650,
+                                           value=int(flt.get("verdict_ttl_days", 90)), step=10)
+        enable_criteria_hash = st.checkbox(
+            "提示词/模型变化时强制重判",
+            value=bool(flt.get("enable_criteria_hash", False)))
 
         c1, c2 = st.columns(2)
         submitted = c1.form_submit_button("保存配置", width="stretch")
@@ -1414,16 +1424,19 @@ def _render_config_form(cfg):
             "base_url": base_url, "api_key": api_key, "model": model, "timeout": timeout,
             "regions": regions, "charts": charts, "feed_limit": feed_limit,
             "max_benchmarks": max_benchmarks, "llm_input_limit": llm_input_limit,
-            "rss_retries": rss_retries,
+            "rss_retries": rss_retries, "enrich_itunes": enrich_itunes,
             "max_comments_per_app": max_comments_per_app,
             "bad_rating_threshold": bad_rating_threshold, "max_competitors": max_competitors,
             "max_keywords_per_benchmark": max_keywords_per_benchmark,
             "comment_pages": comment_pages,
             "filter_candidates_limit": filter_candidates_limit,
             "enable_llm_filter": enable_llm_filter,
-            "db_path": db_path, "refresh_threshold_days": refresh_threshold_days,
+            "db_path": db_path, "decisions_db_path": decisions_db_path,
+            "refresh_threshold_days": refresh_threshold_days,
             "auto_clean_days": auto_clean_days,
-            "recent_days": recent_days, "max_apps": max_apps, "max_results": max_results,
+            "max_apps": max_apps, "batch_size": batch_size,
+            "verdict_ttl_days": verdict_ttl_days,
+            "enable_criteria_hash": enable_criteria_hash,
         })
         errors = validate_config(new_cfg)
         if errors:

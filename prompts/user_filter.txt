@@ -24,16 +24,17 @@
 {database_json}
 
 输出要求：
-按你认为最有潜力的顺序（综合考虑：需求验证、开发可行性、竞争态势、原生能力契合度），返回最多 {max_results} 个机会。
+对输入中的**每一个应用**给出裁决，按你认为最有潜力的顺序排序。不要遗漏任何应用。
 
 JSON 格式：
 [
   {{
+    "apple_id": "Apple ID（原样回填）",
     "name": "应用名",
-    "apple_id": "Apple ID",
-    "jtbd": "用户任务",
-    "why_pick": "为什么适合我（2-3句话，说明需求验证 + 开发可行性 + 原生能力）",
-    "attack_vector": "主要切入点（生态空白 或 竞品具体痛点）",
+    "verdict": "accept 或 reject",
+    "score": 85,
+    "reason": "一句话理由，必须引用输入中的事实",
+    "attack_vector": "主要切入点（生态空白 或 竞品具体痛点）；reject 时可为空",
     "native_features": ["推荐的鸿蒙能力1", "推荐的鸿蒙能力2"],
     "competitors_summary": "华为竞品概况（数量/评分/主要痛点，1句话）"
   }}

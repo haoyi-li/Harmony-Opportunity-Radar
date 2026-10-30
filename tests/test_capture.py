@@ -56,6 +56,10 @@ class CaptureConfigTest(unittest.TestCase):
     def test_llm_input_limit_default(self):
         self.assertEqual(config.DEFAULTS["capture"]["llm_input_limit"], 200)
 
+    def test_feed_limit_and_enrichment_defaults(self):
+        self.assertEqual(config.DEFAULTS["capture"]["feed_limit"], 200)
+        self.assertTrue(config.DEFAULTS["capture"]["enrich_itunes"])
+
     def test_llm_input_limit_range(self):
         cfg = config.load_config()
         cfg["capture"]["llm_input_limit"] = 0

@@ -217,10 +217,98 @@ class StatsTest(DatabaseTestCase):
         stats = database.get_stats(self.db)
         for key in ("total", "new_7", "new_30", "stale", "blank",
                     "with_competitors", "probed", "unprobed", "pain_apps",
-                    "favorites", "competitor_rows", "review_rows"):
+                    "favorites", "benchmarks", "catalog", "snapshots",
+                    "competitor_rows", "review_rows"):
             self.assertIn(key, stats)
         self.assertEqual(stats["total"], 1)
         self.assertEqual(stats["unprobed"], 1)
+
+
+class CatalogSnapshotTest(DatabaseTestCase):
+    def test_snapshot_appended_only_when_metrics_change(self):
+        app = _bm("1", "A", source_charts=["apple/cn/top-free"], rank=10,
+                  avg_rating=4.0, rating_count=1000)
+        database.upsert_app(app, db_path=self.db, seen_at="2026-01-01T00:00:00+08:00")
+        self.assertEqual(database.get_stats(self.db)["snapshots"], 1)
+
+        database.upsert_app(app, db_path=self.db, seen_at="2026-01-02T00:00:00+08:00")
+        self.assertEqual(database.get_stats(self.db)["snapshots"], 1)
+
+        app2 = dict(app, avg_rating=4.5)
+        database.upsert_app(app2, db_path=self.db,
+                            seen_at="2026-01-03T00:00:00+08:00")
+        self.assertEqual(database.get_stats(self.db)["snapshots"], 2)
+        detail = database.get_app_detail("1", db_path=self.db)
+        self.assertAlmostEqual(detail["avg_rating"], 4.5, places=2)
+        self.assertEqual(detail["best_rank"], 10)
+        self.assertEqual(detail["chart_hits"], ["apple/cn/top-free"])
+        self.assertEqual(detail["metrics_version"], 2)
+
+
+class VerdictCacheTest(DatabaseTestCase):
+    def setUp(self):
+        super().setUp()
+        self.dec = str(Path(self.tmp.name) / "decisions.db")
+        database.init_decisions_db(self.dec)
+
+    def _verdict(self, filtered_at="2026-01-02T00:00:00+08:00"):
+        return {
+            "apple_id": "1", "verdict": "reject", "score": None,
+            "reason": "证据不足", "attack_vector": "", "native_features": "[]",
+            "competitors_summary": "", "basis": "catalog_only",
+            "app_metrics_version": 1, "probe_snapshot_at": None,
+            "competitor_count_snapshot": 0, "criteria_hash": "",
+            "model": "m", "batch_id": "b1", "filtered_at": filtered_at,
+            "expires_at": "2099-01-01T00:00:00+08:00",
+        }
+
+    def test_reject_verdict_is_cached_and_probe_invalidates(self):
+        database.upsert_app(_bm("1", "A"), db_path=self.db,
+                            seen_at="2026-01-01T00:00:00+08:00")
+        pending = database.apps_needing_verdict(
+            self.db, self.dec, limit=10,
+            now="2026-01-03T00:00:00+08:00")
+        self.assertEqual(len(pending), 1)
+
+        database.insert_verdicts([self._verdict()], decisions_db_path=self.dec)
+        pending = database.apps_needing_verdict(
+            self.db, self.dec, limit=10,
+            now="2026-01-03T00:00:00+08:00")
+        self.assertEqual(pending, [])
+
+        # catalog_only 裁决之后发生 probe → 依据升级，必须重判
+        database.save_probe_record(
+            _probe(competitors=[_comp()]), "2026-01-04T00:00:00+08:00",
+            db_path=self.db)
+        pending = database.apps_needing_verdict(
+            self.db, self.dec, limit=10,
+            now="2026-01-05T00:00:00+08:00")
+        self.assertEqual([a["apple_id"] for a in pending], ["1"])
+
+
+class ValidateIdeaTest(DatabaseTestCase):
+    def test_validate_idea_returns_apple_and_huawei_facts(self):
+        database.upsert_app(
+            _bm("1", "笔记工具", genre="Productivity", avg_rating=4.5,
+                rating_count=12000, best_rank=5,
+                chart_hits=["apple/cn/top-free"]),
+            db_path=self.db)
+        database.save_probe_record(
+            _probe("1", "笔记工具",
+                   competitors=[_comp("pkg.notes", 3.2,
+                                      pains=[{"issue": "同步慢",
+                                              "frequency": "高频",
+                                              "quote": "同步太慢了"}])]),
+            "2026-01-01T00:00:00+08:00", db_path=self.db)
+
+        result = database.validate_idea("笔记", db_path=self.db)
+        self.assertEqual(len(result["found_benchmarks"]), 1)
+        item = result["found_benchmarks"][0]
+        self.assertEqual(item["apple"]["genre"], "Productivity")
+        self.assertEqual(item["apple"]["chart_hits"], ["apple/cn/top-free"])
+        self.assertEqual(item["huawei"]["competitor_count"], 1)
+        self.assertEqual(item["huawei"]["competitors"][0]["high_freq_pains"][0]["issue"],
+                         "同步慢")
 
 
 if __name__ == "__main__":

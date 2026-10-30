@@ -18,6 +18,7 @@ from pathlib import Path
 from radar.config import DATA_DIR, PROJECT_ROOT
 
 DEFAULT_DB_PATH = DATA_DIR / "apps.db"
+DEFAULT_DECISIONS_DB_PATH = DATA_DIR / "decisions.db"
 
 # 高频/中频/低频 → 展示排序权重
 FREQ_ORDER = {"高频": 0, "中频": 1, "低频": 2}
@@ -42,11 +43,37 @@ CREATE TABLE IF NOT EXISTS apps (
   probe_status TEXT,
   probe_evidence_grade TEXT,
   competitor_count INTEGER DEFAULT 0,
-  is_favorite INTEGER DEFAULT 0
+  is_favorite INTEGER DEFAULT 0,
+  -- 目录层详情（iTunes lookup 补齐，不参与 LLM 精选）
+  genre TEXT,
+  description TEXT,
+  avg_rating REAL,
+  rating_count INTEGER,
+  price REAL,
+  release_date TEXT,
+  -- 榜单事实与增量快照
+  best_rank INTEGER,
+  chart_hits TEXT,
+  is_benchmark INTEGER DEFAULT 0,
+  metrics_version INTEGER DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS idx_apps_apple_id ON apps(apple_id);
 CREATE INDEX IF NOT EXISTS idx_apps_last_seen ON apps(last_seen);
 CREATE INDEX IF NOT EXISTS idx_apps_needs_refresh ON apps(needs_refresh);
+
+CREATE TABLE IF NOT EXISTS app_snapshots (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  apple_id TEXT NOT NULL,
+  captured_at TEXT NOT NULL,
+  avg_rating REAL,
+  rating_count INTEGER,
+  best_rank INTEGER,
+  chart_hits TEXT,
+  metrics_version INTEGER,
+  FOREIGN KEY (apple_id) REFERENCES apps(apple_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_snapshot_apple_id
+  ON app_snapshots(apple_id, captured_at DESC);
 
 CREATE TABLE IF NOT EXISTS competitors (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -84,6 +111,59 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 """
 
+# 产物库：筛选裁决、批次记录与知识模式。与 apps.db 单向依赖：
+# filter 读 apps.db → 写 decisions.db；apps.db 永远不引用 decisions.db。
+DECISIONS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS app_verdicts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  apple_id TEXT NOT NULL,
+  verdict TEXT NOT NULL,
+  score REAL,
+  reason TEXT,
+  attack_vector TEXT,
+  native_features TEXT,
+  competitors_summary TEXT,
+  basis TEXT NOT NULL,
+  app_metrics_version INTEGER,
+  probe_snapshot_at TEXT,
+  competitor_count_snapshot INTEGER,
+  criteria_hash TEXT,
+  model TEXT NOT NULL,
+  batch_id TEXT,
+  filtered_at TEXT NOT NULL,
+  expires_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_verdict_apple_id
+  ON app_verdicts(apple_id, filtered_at DESC);
+CREATE INDEX IF NOT EXISTS idx_verdict_expires ON app_verdicts(expires_at);
+
+CREATE TABLE IF NOT EXISTS filter_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  batch_id TEXT NOT NULL,
+  model TEXT NOT NULL,
+  criteria_hash TEXT,
+  input_count INTEGER,
+  accept_count INTEGER,
+  reject_count INTEGER,
+  cached_count INTEGER,
+  started_at TEXT NOT NULL,
+  finished_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_filter_runs_batch ON filter_runs(batch_id);
+
+CREATE TABLE IF NOT EXISTS knowledge_patterns (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  genre TEXT NOT NULL,
+  pattern_type TEXT NOT NULL,
+  pattern_summary TEXT NOT NULL,
+  evidence_count INTEGER DEFAULT 1,
+  extracted_at TEXT NOT NULL,
+  last_updated TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pattern_genre
+  ON knowledge_patterns(genre, pattern_type);
+"""
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
@@ -96,6 +176,19 @@ def resolve_db_path(cfg: dict | None = None) -> Path:
         raw = str((cfg.get("database") or {}).get("path", "") or "").strip()
     if not raw:
         return DEFAULT_DB_PATH
+    path = Path(raw)
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    return path
+
+
+def resolve_decisions_db_path(cfg: dict | None = None) -> Path:
+    """解析产物库路径（decisions.db），默认 data/decisions.db。"""
+    raw = ""
+    if isinstance(cfg, dict):
+        raw = str((cfg.get("database") or {}).get("decisions_path", "") or "").strip()
+    if not raw:
+        return DEFAULT_DECISIONS_DB_PATH
     path = Path(raw)
     if not path.is_absolute():
         path = PROJECT_ROOT / path
@@ -118,11 +211,105 @@ def connect(db_path=None) -> sqlite3.Connection:
 
 
 def init_db(db_path=None) -> Path:
-    """初始化数据库：创建表与索引（幂等）。"""
+    """初始化数据库：创建表与索引，并对既有库做增量迁移（幂等）。"""
     path = Path(db_path) if db_path else DEFAULT_DB_PATH
     conn = connect(path)
     try:
         conn.executescript(SCHEMA)
+        conn.commit()
+    finally:
+        conn.close()
+    migrate_schema(path)
+    return path
+
+
+# 既有数据库需要补齐的目录层 / 快照字段。SQLite 只支持 ADD COLUMN。
+_MIGRATION_COLUMNS = {
+    "genre": "TEXT",
+    "description": "TEXT",
+    "avg_rating": "REAL",
+    "rating_count": "INTEGER",
+    "price": "REAL",
+    "release_date": "TEXT",
+    "best_rank": "INTEGER",
+    "chart_hits": "TEXT",
+    "is_benchmark": "INTEGER DEFAULT 0",
+    "metrics_version": "INTEGER DEFAULT 1",
+}
+
+
+def migrate_schema(db_path=None) -> list[str]:
+    """增量 Schema 迁移：只添加列/表，不删除、不重命名，保留现有数据。
+
+    返回实际新增的列名列表（首次迁移便于在日志中展示）。
+    """
+    path = Path(db_path) if db_path else DEFAULT_DB_PATH
+    conn = connect(path)
+    added: list[str] = []
+    try:
+        existing_cols = {row[1] for row in
+                         conn.execute("PRAGMA table_info(apps)").fetchall()}
+        for col, typ in _MIGRATION_COLUMNS.items():
+            if col not in existing_cols:
+                conn.execute(f"ALTER TABLE apps ADD COLUMN {col} {typ}")
+                added.append(col)
+
+        conn.executescript("""
+        CREATE TABLE IF NOT EXISTS app_snapshots (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          apple_id TEXT NOT NULL,
+          captured_at TEXT NOT NULL,
+          avg_rating REAL,
+          rating_count INTEGER,
+          best_rank INTEGER,
+          chart_hits TEXT,
+          metrics_version INTEGER,
+          FOREIGN KEY (apple_id) REFERENCES apps(apple_id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_snapshot_apple_id
+          ON app_snapshots(apple_id, captured_at DESC);
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_apps_benchmark "
+                     "ON apps(is_benchmark)")
+
+        # 回填：老库中没有 is_benchmark/metrics_version 的应用。
+        conn.execute(
+            "UPDATE apps SET metrics_version=1 "
+            "WHERE metrics_version IS NULL OR metrics_version < 1")
+        conn.execute(
+            "UPDATE apps SET is_benchmark=1 "
+            "WHERE (is_benchmark IS NULL OR is_benchmark=0) "
+            "AND jtbd IS NOT NULL AND TRIM(jtbd) <> ''")
+
+        # 回填 chart_hits：历史库只有逗号分隔的 source_charts 字符串。
+        rows = conn.execute(
+            "SELECT apple_id, source_charts FROM apps "
+            "WHERE (chart_hits IS NULL OR chart_hits='') "
+            "AND source_charts IS NOT NULL AND TRIM(source_charts) <> ''"
+        ).fetchall()
+        for row in rows:
+            hits = _chart_list(row["source_charts"])
+            if hits:
+                conn.execute(
+                    "UPDATE apps SET chart_hits=? WHERE apple_id=?",
+                    (json.dumps(hits, ensure_ascii=False), row["apple_id"]))
+        conn.commit()
+    except sqlite3.Error:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    if added:
+        print("  [migrate] 已为 apps 表补充字段: " + ", ".join(added))
+    return added
+
+
+def init_decisions_db(db_path=None) -> Path:
+    """初始化产物库（decisions.db）：裁决、批次与知识模式表（幂等）。"""
+    path = Path(db_path) if db_path else DEFAULT_DECISIONS_DB_PATH
+    conn = connect(path)
+    try:
+        conn.executescript(DECISIONS_SCHEMA)
         conn.commit()
     finally:
         conn.close()
@@ -132,64 +319,242 @@ def init_db(db_path=None) -> Path:
 # ============================================================
 # 写入：capture
 # ============================================================
-def upsert_app(benchmark: dict, db_path=None, seen_at: str | None = None) -> str | None:
+def _chart_list(value) -> list[str]:
+    """把 source_charts / chart_hits 统一规范为去重后的榜单列表。"""
+    if isinstance(value, (list, tuple, set)):
+        items = list(value)
+    elif isinstance(value, str):
+        items = value.replace("，", ",").split(",")
+    else:
+        return []
+    result: list[str] = []
+    for item in items:
+        text = str(item or "").strip()
+        if text and text not in result:
+            result.append(text)
+    return result
+
+
+def _stored_chart_list(value) -> list[str]:
+    """解析数据库里以 JSON 文本存储的 chart_hits（兼容旧的逗号字符串）。"""
+    if isinstance(value, str):
+        text = value.strip()
+        if text.startswith("["):
+            try:
+                return _chart_list(json.loads(text))
+            except (TypeError, ValueError):
+                pass
+    return _chart_list(value)
+
+
+def _to_int(val) -> int | None:
+    if val is None or isinstance(val, bool):
+        return None
+    try:
+        return int(float(val))
+    except (TypeError, ValueError):
+        return None
+
+
+def _metrics_changed(old: sqlite3.Row, app: dict, best_rank: int | None,
+                     chart_hits: list[str]) -> bool:
+    """判断是否需要追加指标快照。
+
+    - avg_rating / best_rank / 榜单覆盖变化：任意变化即记录；
+    - rating_count：只有变化超过 1%（且至少 20 条）才记录，避免每天为
+      几十条新增评论写一行快照，把 800 个应用的表撑爆。
+    """
+    new_rating = _to_float(app.get("avg_rating"))
+    old_rating = _to_float(old["avg_rating"])
+    if new_rating is not None and new_rating != old_rating:
+        return True
+
+    new_count = _to_int(app.get("rating_count"))
+    old_count = _to_int(old["rating_count"])
+    if new_count is not None:
+        if old_count is None:
+            return True
+        if new_count != old_count and abs(new_count - old_count) >= max(
+                20, int(old_count * 0.01)):
+            return True
+
+    if best_rank is not None and best_rank != _to_int(old["best_rank"]):
+        return True
+
+    old_hits = set(_stored_chart_list(old["chart_hits"]))
+    if set(chart_hits) - old_hits:
+        return True
+    return False
+
+
+def upsert_app(benchmark: dict, db_path=None, seen_at: str | None = None,
+               *, _conn: sqlite3.Connection | None = None,
+               _commit: bool = True, bump_capture: bool = True,
+               is_benchmark: bool | None = None) -> str | None:
     """插入或更新 apps 表，返回 apple_id（无 apple_id 时返回 None，不入库）。
 
-    已存在的应用只刷新 last_seen / capture_count 与可能变动的文本字段，
-    不重置 last_probe_at / is_blank / competitor_count 等 probe 事实。
+    - 目录层应用（is_benchmark=0）与 LLM 精选标杆（is_benchmark=1）共用本函数；
+    - 已存在的应用只刷新 last_seen / capture_count 与可能变动的文本字段，
+      不重置 last_probe_at / is_blank / competitor_count 等 probe 事实；
+    - rating / rating_count / best_rank / 榜单覆盖变化时追加 app_snapshots。
     """
-    apple_id = str((benchmark or {}).get("apple_id", "") or "").strip()
-    name = str((benchmark or {}).get("name", "") or "").strip()
+    app = benchmark or {}
+    apple_id = str(app.get("apple_id", "") or "").strip()
+    name = str(app.get("name", "") or "").strip()
     if not apple_id or not name:
         return None
     now = seen_at or _now()
-    keywords = benchmark.get("search_keywords") or []
+    keywords = app.get("search_keywords") or []
     if not isinstance(keywords, list):
         keywords = []
-    conn = connect(db_path)
+    owned_conn = _conn is None
+    conn = _conn or connect(db_path)
     try:
+        old = conn.execute("SELECT * FROM apps WHERE apple_id=?",
+                           (apple_id,)).fetchone()
+        raw_charts = app.get("source_charts")
+        source_charts_text = (", ".join(_chart_list(raw_charts))
+                              if isinstance(raw_charts, (list, tuple, set))
+                              else str(raw_charts or ""))
+        chart_hits = _chart_list(app.get("chart_hits") or raw_charts)
+        if old is not None:
+            chart_hits = _chart_list(_stored_chart_list(old["chart_hits"]) + chart_hits)
+        new_rank = _to_int(app.get("rank"))
+        old_rank = _to_int(old["best_rank"]) if old is not None else None
+        ranked = [r for r in (old_rank, new_rank) if r is not None]
+        best_rank = min(ranked) if ranked else None
+
+        version = (_to_int(old["metrics_version"]) or 1) if old is not None else 1
+        changed = old is None
+        if old is not None and _metrics_changed(old, app, best_rank, chart_hits):
+            changed = True
+            version += 1
+
+        flag = 1 if is_benchmark else (1 if app.get("is_benchmark") else 0)
         conn.execute(
             """
-            INSERT INTO apps (apple_id, name, artist, jtbd, pick_reason, search_keywords,
-                              url, source_charts, first_seen, last_seen, capture_count)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+            INSERT INTO apps (
+              apple_id, name, artist, jtbd, pick_reason, search_keywords,
+              url, source_charts, genre, description, avg_rating, rating_count,
+              price, release_date, best_rank, chart_hits, is_benchmark,
+              metrics_version, first_seen, last_seen, capture_count)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, 1)
             ON CONFLICT(apple_id) DO UPDATE SET
               name=excluded.name,
-              artist=excluded.artist,
-              jtbd=excluded.jtbd,
-              pick_reason=excluded.pick_reason,
-              search_keywords=excluded.search_keywords,
-              url=excluded.url,
-              source_charts=excluded.source_charts,
+              artist=COALESCE(NULLIF(excluded.artist, ''), apps.artist),
+              jtbd=COALESCE(NULLIF(excluded.jtbd, ''), apps.jtbd),
+              pick_reason=COALESCE(NULLIF(excluded.pick_reason, ''), apps.pick_reason),
+              search_keywords=COALESCE(NULLIF(excluded.search_keywords, '[]'),
+                                       apps.search_keywords),
+              url=COALESCE(NULLIF(excluded.url, ''), apps.url),
+              source_charts=COALESCE(NULLIF(excluded.source_charts, ''),
+                                     apps.source_charts),
+              genre=COALESCE(NULLIF(excluded.genre, ''), apps.genre),
+              description=COALESCE(NULLIF(excluded.description, ''),
+                                   apps.description),
+              avg_rating=COALESCE(excluded.avg_rating, apps.avg_rating),
+              rating_count=COALESCE(excluded.rating_count, apps.rating_count),
+              price=COALESCE(excluded.price, apps.price),
+              release_date=COALESCE(NULLIF(excluded.release_date, ''),
+                                    apps.release_date),
+              best_rank=COALESCE(excluded.best_rank, apps.best_rank),
+              chart_hits=excluded.chart_hits,
+              is_benchmark=MAX(apps.is_benchmark, excluded.is_benchmark),
+              metrics_version=excluded.metrics_version,
               last_seen=excluded.last_seen,
-              capture_count=apps.capture_count + 1
+              capture_count=apps.capture_count + ?
             """,
             (
                 apple_id, name,
-                benchmark.get("artist", ""),
-                benchmark.get("jtbd", ""),
-                benchmark.get("pick_reason", ""),
+                app.get("artist", ""),
+                app.get("jtbd", ""),
+                app.get("pick_reason", ""),
                 json.dumps(keywords, ensure_ascii=False),
-                benchmark.get("url", ""),
-                benchmark.get("source_charts", ""),
+                app.get("url", ""),
+                source_charts_text,
+                app.get("genre", ""),
+                app.get("description", ""),
+                _to_float(app.get("avg_rating")),
+                _to_int(app.get("rating_count")),
+                _to_float(app.get("price")),
+                app.get("release_date", ""),
+                best_rank,
+                json.dumps(chart_hits, ensure_ascii=False),
+                flag,
+                version,
                 now, now,
+                1 if bump_capture else 0,
             ),
         )
-        conn.commit()
+        if changed:
+            conn.execute(
+                """
+                INSERT INTO app_snapshots (
+                  apple_id, captured_at, avg_rating, rating_count, best_rank,
+                  chart_hits, metrics_version)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (apple_id, now,
+                 _to_float(app.get("avg_rating")) if app.get("avg_rating") is not None
+                 else (old["avg_rating"] if old is not None else None),
+                 _to_int(app.get("rating_count")) if app.get("rating_count") is not None
+                 else (old["rating_count"] if old is not None else None),
+                 best_rank,
+                 json.dumps(chart_hits, ensure_ascii=False),
+                 version),
+            )
+        if owned_conn and _commit:
+            conn.commit()
     finally:
-        conn.close()
+        if owned_conn:
+            conn.close()
     return apple_id
 
 
-def upsert_benchmarks(benchmarks: list[dict], db_path=None,
-                      seen_at: str | None = None) -> int:
-    """批量写入 capture 精选结果，返回成功入库条数。"""
+def upsert_catalog_apps(apps: list[dict], db_path=None,
+                        seen_at: str | None = None) -> dict:
+    """把一轮 RSS 全量目录写入 apps 表（is_benchmark 保持 0）。
+
+    返回 {"apps": 入库数, "snapshots": 快照数}；单连接批量执行，避免
+    800 个应用各开一次 SQLite 连接。
+    """
     now = seen_at or _now()
-    count = 0
-    for bm in benchmarks or []:
-        if upsert_app(bm, db_path=db_path, seen_at=now):
-            count += 1
-    return count
+    valid = [a for a in (apps or []) if str(a.get("apple_id", "")).strip()
+             and str(a.get("name", "")).strip()]
+    if not valid:
+        return {"apps": 0, "snapshots": 0}
+    conn = connect(db_path)
+    try:
+        before = _scalar(conn, "SELECT COUNT(*) FROM app_snapshots")
+        count = 0
+        for app in valid:
+            if upsert_app(app, seen_at=now, _conn=conn, _commit=False):
+                count += 1
+        conn.commit()
+        after = _scalar(conn, "SELECT COUNT(*) FROM app_snapshots")
+        return {"apps": count, "snapshots": max(0, int(after) - int(before))}
+    finally:
+        conn.close()
+
+
+def upsert_benchmarks(benchmarks: list[dict], db_path=None,
+                      seen_at: str | None = None, bump_capture: bool = True) -> int:
+    """批量写入 capture 精选结果并标记 is_benchmark=1，返回成功入库条数。"""
+    now = seen_at or _now()
+    if not (benchmarks or []):
+        return 0
+    conn = connect(db_path)
+    try:
+        count = 0
+        for bm in benchmarks or []:
+            if upsert_app(bm, seen_at=now, _conn=conn, _commit=False,
+                          bump_capture=bump_capture, is_benchmark=True):
+                count += 1
+        conn.commit()
+        return count
+    finally:
+        conn.close()
 
 
 # ============================================================
@@ -357,9 +722,17 @@ def _app_row(row: sqlite3.Row) -> dict:
         data["search_keywords"] = json.loads(data.get("search_keywords") or "[]")
     except (ValueError, TypeError):
         data["search_keywords"] = []
+    try:
+        data["chart_hits"] = _stored_chart_list(data.get("chart_hits"))
+        if not data["chart_hits"]:
+            data["chart_hits"] = _chart_list(data.get("source_charts"))
+    except (ValueError, TypeError):
+        data["chart_hits"] = _chart_list(data.get("source_charts"))
     data["is_blank"] = bool(data.get("is_blank"))
     data["needs_refresh"] = bool(data.get("needs_refresh"))
     data["is_favorite"] = bool(data.get("is_favorite"))
+    data["is_benchmark"] = bool(data.get("is_benchmark"))
+    data["metrics_version"] = int(data.get("metrics_version") or 1)
     return data
 
 
@@ -576,6 +949,8 @@ def get_stats(db_path=None) -> dict:
             JOIN competitors c ON r.competitor_id=c.id
             WHERE r.frequency IN ('高频','中频')""")
         favorites = _scalar(conn, "SELECT COUNT(*) FROM apps WHERE is_favorite=1")
+        benchmarks = _scalar(conn, "SELECT COUNT(*) FROM apps WHERE is_benchmark=1")
+        snapshots = _scalar(conn, "SELECT COUNT(*) FROM app_snapshots")
         competitors = _scalar(conn, "SELECT COUNT(*) FROM competitors")
         reviews = _scalar(conn, "SELECT COUNT(*) FROM reviews")
         last_capture = _scalar(conn, "SELECT MAX(last_seen) FROM apps") or ""
@@ -593,6 +968,9 @@ def get_stats(db_path=None) -> dict:
         "unprobed": int(total) - int(probed),
         "pain_apps": pain_apps,
         "favorites": favorites,
+        "benchmarks": benchmarks,
+        "catalog": int(total) - int(benchmarks),
+        "snapshots": snapshots,
         "competitor_rows": competitors,
         "review_rows": reviews,
         "last_capture": last_capture,
@@ -636,9 +1014,67 @@ def toggle_favorite(apple_id: str, db_path=None) -> bool:
         conn.close()
 
 
+def _attach_latest_competitors(conn: sqlite3.Connection, apps: list[dict],
+                               per_app_limit: int = 3,
+                               pains_per_comp: int = 3) -> list[dict]:
+    """为应用列表附上「最近一轮 probe」的竞品与痛点摘要（就地修改并返回）。"""
+    if not apps:
+        return apps
+    ids = [a["apple_id"] for a in apps]
+    placeholders = ",".join("?" * len(ids))
+    comp_rows = conn.execute(
+        f"""
+        SELECT c.* FROM competitors c JOIN apps a ON a.apple_id=c.apple_id
+        WHERE a.apple_id IN ({placeholders}) AND c.probed_at=a.last_probe_at
+        ORDER BY c.rating DESC, c.id DESC
+        """,
+        ids,
+    ).fetchall()
+    rev_rows = conn.execute(
+        f"""
+        SELECT r.*, c.apple_id AS apple_id FROM reviews r
+        JOIN competitors c ON r.competitor_id=c.id
+        WHERE c.apple_id IN ({placeholders}) AND c.probed_at=(SELECT last_probe_at
+          FROM apps WHERE apple_id=c.apple_id)
+        """,
+        ids,
+    ).fetchall()
+
+    pains_by_comp: dict[int, list[dict]] = {}
+    for r in rev_rows:
+        pains_by_comp.setdefault(int(r["competitor_id"]), []).append(dict(r))
+
+    comps_by_app: dict[str, list[dict]] = {}
+    for c in comp_rows:
+        bucket = comps_by_app.setdefault(c["apple_id"], [])
+        if len(bucket) >= per_app_limit:
+            continue
+        pains = pains_by_comp.get(int(c["id"]), [])
+        bucket.append({
+            "name": c["name"],
+            "package": c["package"],
+            "rating": c["rating"],
+            "downloads": c["downloads"],
+            "pain_points": [{"issue": p.get("issue", ""),
+                             "frequency": p.get("frequency", "")}
+                            for p in pains[:pains_per_comp]],
+        })
+
+    for app in apps:
+        app["competitors"] = comps_by_app.get(app["apple_id"], [])
+        ratings = [c["rating"] for c in app["competitors"]
+                   if isinstance(c["rating"], (int, float))]
+        app["latest_probe"] = {
+            "probed_at": app.get("last_probe_at") or "",
+            "avg_rating": round(sum(ratings) / len(ratings), 2) if ratings else None,
+        }
+    return apps
+
+
 def apps_for_filter(days: int = 60, db_path=None, limit: int = 300) -> list[dict]:
     """AI 筛选输入：最近 N 天出现的应用 + 最近一轮竞品与痛点摘要。
 
+    保留给旧调用方；增量筛选请用 apps_needing_verdict()。
     只取最近一轮 probe 的竞品（最多 3 个）与痛点（每个最多 3 条），
     把 token 预算留给应用数量而不是历史冗余。
     """
@@ -654,59 +1090,320 @@ def apps_for_filter(days: int = 60, db_path=None, limit: int = 300) -> list[dict
             (_days_ago(days), int(limit)),
         ).fetchall()
         apps = [_app_row(r) for r in rows]
-        if not apps:
-            return []
-        ids = [a["apple_id"] for a in apps]
-        placeholders = ",".join("?" * len(ids))
-        comp_rows = conn.execute(
-            f"""
-            SELECT c.* FROM competitors c JOIN apps a ON a.apple_id=c.apple_id
-            WHERE a.apple_id IN ({placeholders}) AND c.probed_at=a.last_probe_at
-            ORDER BY c.rating DESC, c.id DESC
-            """,
-            ids,
-        ).fetchall()
-        rev_rows = conn.execute(
-            f"""
-            SELECT r.*, c.apple_id AS apple_id FROM reviews r
-            JOIN competitors c ON r.competitor_id=c.id
-            WHERE c.apple_id IN ({placeholders}) AND c.probed_at=(SELECT last_probe_at
-              FROM apps WHERE apple_id=c.apple_id)
-            """,
-            ids,
-        ).fetchall()
+        return _attach_latest_competitors(conn, apps)
     finally:
         conn.close()
 
-    pains_by_comp: dict[int, list[dict]] = {}
-    for r in rev_rows:
-        pains_by_comp.setdefault(int(r["competitor_id"]), []).append(dict(r))
 
-    comps_by_app: dict[str, list[dict]] = {}
-    for c in comp_rows:
-        bucket = comps_by_app.setdefault(c["apple_id"], [])
-        if len(bucket) >= 3:
+def apps_needing_verdict(db_path=None, decisions_db_path=None, limit: int = 300,
+                         criteria_hash: str = "",
+                         include_hash_change: bool = False,
+                         now: str | None = None) -> list[dict]:
+    """返回需要（重新）裁决的应用，按「标杆 > 最佳排名 > 最近出现」排序。
+
+    需要裁决的判定：
+      1. 从未有裁决；
+      2. 最新裁决 basis='catalog_only'，但应用之后已被 probe（依据升级）；
+      3. 最新裁决已过 TTL；
+      4. 可选：提示词/模型哈希变化（include_hash_change=True）。
+    只返回应用事实 + 最近一轮竞品摘要，不返回历史裁决全文。
+    """
+    raw_path = Path(db_path) if db_path else DEFAULT_DB_PATH
+    dec_path = Path(decisions_db_path) if decisions_db_path else DEFAULT_DECISIONS_DB_PATH
+    now = now or _now()
+    conn = connect(raw_path)
+    try:
+        conn.execute("ATTACH DATABASE ? AS decisions", (str(dec_path),))
+        clauses = [
+            "v.id IS NULL",
+            "v.expires_at IS NULL OR v.expires_at <= ?",
+            "(v.basis='catalog_only' AND a.last_probe_at IS NOT NULL "
+            " AND a.last_probe_at > v.filtered_at)",
+        ]
+        params: list = [now]
+        if include_hash_change and criteria_hash:
+            clauses.append("(v.criteria_hash IS NOT NULL AND v.criteria_hash <> '' "
+                           "AND v.criteria_hash <> ?)")
+            params.append(criteria_hash)
+        sql = f"""
+        SELECT a.* FROM apps a
+        LEFT JOIN (
+          SELECT apple_id, MAX(id) AS max_id
+          FROM decisions.app_verdicts GROUP BY apple_id
+        ) l ON l.apple_id = a.apple_id
+        LEFT JOIN decisions.app_verdicts v ON v.id = l.max_id
+        WHERE {' OR '.join('(' + c + ')' for c in clauses)}
+        ORDER BY a.is_benchmark DESC,
+                 CASE WHEN a.best_rank IS NULL THEN 1 ELSE 0 END,
+                 a.best_rank ASC,
+                 a.last_seen DESC
+        LIMIT ?
+        """
+        params.append(int(limit))
+        rows = conn.execute(sql, params).fetchall()
+        apps = [_app_row(r) for r in rows]
+        return _attach_latest_competitors(conn, apps)
+    finally:
+        conn.close()
+
+
+def latest_accepted_verdicts(decisions_db_path=None, db_path=None) -> list[dict]:
+    """返回每个应用最新一条裁决中 verdict='accept' 的记录（附带应用事实）。"""
+    raw_path = Path(db_path) if db_path else DEFAULT_DB_PATH
+    dec_path = Path(decisions_db_path) if decisions_db_path else DEFAULT_DECISIONS_DB_PATH
+    conn = connect(raw_path)
+    try:
+        conn.execute("ATTACH DATABASE ? AS decisions", (str(dec_path),))
+        rows = conn.execute(
+            """
+            SELECT v.*, a.name AS app_name, a.artist AS app_artist,
+                   a.jtbd AS app_jtbd, a.url AS app_url, a.is_blank,
+                   a.competitor_count, a.genre, a.avg_rating, a.rating_count,
+                   a.best_rank, a.chart_hits, a.last_probe_at
+            FROM decisions.app_verdicts v
+            JOIN (
+              SELECT apple_id, MAX(id) AS max_id
+              FROM decisions.app_verdicts GROUP BY apple_id
+            ) l ON l.max_id = v.id
+            LEFT JOIN apps a ON a.apple_id = v.apple_id
+            WHERE v.verdict='accept'
+            ORDER BY v.score DESC, v.filtered_at DESC
+            """
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def count_apps(db_path=None) -> int:
+    conn = connect(db_path)
+    try:
+        return int(_scalar(conn, "SELECT COUNT(*) FROM apps"))
+    finally:
+        conn.close()
+
+
+# ============================================================
+# 写入：filter 裁决（decisions.db）
+# ============================================================
+VERDICT_FIELDS = (
+    "apple_id", "verdict", "score", "reason", "attack_vector",
+    "native_features", "competitors_summary", "basis", "app_metrics_version",
+    "probe_snapshot_at", "competitor_count_snapshot", "criteria_hash",
+    "model", "batch_id", "filtered_at", "expires_at",
+)
+
+
+def insert_verdicts(rows: list[dict], decisions_db_path=None) -> int:
+    """批量写入裁决记录（含 reject），返回写入条数。"""
+    if not rows:
+        return 0
+    path = Path(decisions_db_path) if decisions_db_path else DEFAULT_DECISIONS_DB_PATH
+    conn = connect(path)
+    try:
+        columns = ", ".join(VERDICT_FIELDS)
+        placeholders = ", ".join("?" for _ in VERDICT_FIELDS)
+        conn.executemany(
+            f"INSERT INTO app_verdicts ({columns}) VALUES ({placeholders})",
+            [tuple(row.get(k) for k in VERDICT_FIELDS) for row in rows],
+        )
+        conn.commit()
+        return len(rows)
+    finally:
+        conn.close()
+
+
+def start_filter_run(batch_id: str, model: str, criteria_hash: str,
+                     input_count: int, cached_count: int,
+                     decisions_db_path=None) -> int:
+    """写入一条批次记录（finished_at 留空），返回 filter_runs.id。"""
+    path = Path(decisions_db_path) if decisions_db_path else DEFAULT_DECISIONS_DB_PATH
+    conn = connect(path)
+    try:
+        cur = conn.execute(
+            """INSERT INTO filter_runs
+               (batch_id, model, criteria_hash, input_count, accept_count,
+                reject_count, cached_count, started_at)
+               VALUES (?, ?, ?, ?, 0, 0, ?, ?)""",
+            (batch_id, model, criteria_hash, int(input_count), int(cached_count),
+             _now()),
+        )
+        conn.commit()
+        return int(cur.lastrowid or 0)
+    finally:
+        conn.close()
+
+
+def finish_filter_run(run_id: int, accept_count: int, reject_count: int,
+                      decisions_db_path=None) -> None:
+    if not run_id:
+        return
+    path = Path(decisions_db_path) if decisions_db_path else DEFAULT_DECISIONS_DB_PATH
+    conn = connect(path)
+    try:
+        conn.execute(
+            """UPDATE filter_runs SET accept_count=?, reject_count=?,
+               finished_at=? WHERE id=?""",
+            (int(accept_count), int(reject_count), _now(), int(run_id)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# ============================================================
+# 灵感验证：纯事实查询（不算分，由外部 agent 自行推理）
+# ============================================================
+def validate_idea(idea_keywords: str | list[str], genre: str | None = None,
+                  db_path=None, limit: int = 10) -> dict:
+    """根据产品创意关键词查询 Apple 标杆 + 华为竞品的完整事实。
+
+    返回结构化事实，不做任何评分或结论。外部 agent 可据此自行推理
+    「是否有需求 / 竞品是否饱和 / 痛点在哪里」。
+    """
+    if isinstance(idea_keywords, str):
+        keywords = [kw.strip() for kw in idea_keywords.split() if kw.strip()]
+    else:
+        keywords = [str(kw).strip() for kw in (idea_keywords or [])
+                    if str(kw).strip()]
+
+    query = " ".join(keywords)
+    if not keywords:
+        return {"query": query, "found_benchmarks": [],
+                "error": "关键词不能为空"}
+
+    path = Path(db_path) if db_path else DEFAULT_DB_PATH
+    if not path.exists():
+        return {"query": query, "found_benchmarks": [],
+                "message": f"数据库不存在: {path}，请先运行 capture"}
+    init_db(path)
+
+    keyword_clauses = []
+    params: list = []
+    for kw in keywords:
+        keyword_clauses.append(
+            "(a.name LIKE ? OR a.jtbd LIKE ? OR a.description LIKE ? "
+            "OR a.search_keywords LIKE ?)")
+        like = f"%{kw}%"
+        params.extend([like, like, like, like])
+
+    where = ["(" + " OR ".join(keyword_clauses) + ")"]
+    if genre and str(genre).strip():
+        where.append("a.genre LIKE ?")
+        params.append(f"%{str(genre).strip()}%")
+
+    conn = connect(path)
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT a.* FROM apps a
+            WHERE {' AND '.join(where)}
+            ORDER BY a.is_benchmark DESC,
+                     CASE WHEN a.best_rank IS NULL THEN 1 ELSE 0 END,
+                     a.best_rank ASC,
+                     a.last_seen DESC
+            LIMIT ?
+            """,
+            params + [int(limit)],
+        ).fetchall()
+        apps = [_app_row(r) for r in rows]
+    finally:
+        conn.close()
+
+    if not apps:
+        return {"query": query, "found_benchmarks": [],
+                "message": f"数据库中未找到与 '{query}' 相关的 Apple 应用"}
+
+    benchmarks = []
+    for app in apps:
+        detail = get_app_detail(app["apple_id"], db_path=path)
+        if not detail:
             continue
-        pains = pains_by_comp.get(int(c["id"]), [])
-        bucket.append({
-            "name": c["name"],
-            "package": c["package"],
-            "rating": c["rating"],
-            "downloads": c["downloads"],
-            "pain_points": [{"issue": p.get("issue", ""),
-                             "frequency": p.get("frequency", "")}
-                            for p in pains[:3]],
+        latest_at = detail.get("last_probe_at") or ""
+        latest_competitors = [
+            c for c in detail.get("competitors", [])
+            if latest_at and c.get("probed_at") == latest_at
+        ]
+        competitors = []
+        for comp in latest_competitors[:5]:
+            pains = comp.get("pain_points") or []
+            competitors.append({
+                "name": comp.get("name", ""),
+                "package": comp.get("package", ""),
+                "rating": comp.get("rating"),
+                "downloads": comp.get("downloads", ""),
+                "category": comp.get("category", ""),
+                "intro": comp.get("intro", ""),
+                "update_time": comp.get("update_time", ""),
+                "high_freq_pains": [
+                    {"issue": p.get("issue", ""),
+                     "quote": str(p.get("quote") or "")[:100]}
+                    for p in pains if p.get("frequency") == "高频"
+                ][:3],
+                "mid_freq_pains": [
+                    {"issue": p.get("issue", ""),
+                     "quote": str(p.get("quote") or "")[:100]}
+                    for p in pains if p.get("frequency") == "中频"
+                ][:2],
+            })
+        benchmarks.append({
+            "apple": {
+                "name": detail.get("name", ""),
+                "apple_id": detail.get("apple_id", ""),
+                "url": detail.get("url", ""),
+                "artist": detail.get("artist", ""),
+                "genre": detail.get("genre", ""),
+                "description": detail.get("description", ""),
+                "avg_rating": detail.get("avg_rating"),
+                "rating_count": detail.get("rating_count"),
+                "price": detail.get("price"),
+                "release_date": detail.get("release_date", ""),
+                "best_rank": detail.get("best_rank"),
+                "chart_hits": detail.get("chart_hits") or [],
+                "is_benchmark": bool(detail.get("is_benchmark")),
+                "first_seen": detail.get("first_seen", ""),
+                "last_seen": detail.get("last_seen", ""),
+            },
+            "huawei": {
+                "is_blank": bool(detail.get("is_blank")),
+                "probe_status": detail.get("probe_status") or "",
+                "evidence_grade": detail.get("probe_evidence_grade") or "",
+                "competitor_count": len(latest_competitors),
+                "latest_probe_at": latest_at,
+                "competitors": competitors,
+            },
         })
 
-    for app in apps:
-        app["competitors"] = comps_by_app.get(app["apple_id"], [])
-        ratings = [c["rating"] for c in app["competitors"]
-                   if isinstance(c["rating"], (int, float))]
-        app["latest_probe"] = {
-            "probed_at": app.get("last_probe_at") or "",
-            "avg_rating": round(sum(ratings) / len(ratings), 2) if ratings else None,
-        }
-    return apps
+    summary = {
+        "total_benchmarks": len(benchmarks),
+        "blank_count": sum(1 for b in benchmarks if b["huawei"]["is_blank"]),
+        "high_pain_benchmarks": sum(
+            1 for b in benchmarks
+            if any(len(c.get("high_freq_pains", [])) >= 2
+                   for c in b["huawei"]["competitors"])),
+        "featured_count": 0,
+    }
+    return {"query": query, "found_benchmarks": benchmarks,
+            "summary_stats": summary}
+
+
+def export_idea_validation(idea_keywords: str | list[str],
+                           output_path=None, genre: str | None = None,
+                           db_path=None) -> str:
+    """把 validate_idea 结果导出为 JSON 文件，返回文件路径。"""
+    result = validate_idea(idea_keywords, genre=genre, db_path=db_path)
+    if output_path is None:
+        raw = (idea_keywords if isinstance(idea_keywords, list)
+               else str(idea_keywords).split())
+        safe_name = "_".join(str(k) for k in raw)[:50]
+        safe_name = "".join(
+            c for c in safe_name if c.isalnum() or c in (" ", "_", "-")).strip()
+        output_path = DATA_DIR / "export" / f"idea_{safe_name or 'query'}.json"
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(result, ensure_ascii=False, indent=2),
+                    encoding="utf-8")
+    return str(path)
 
 
 # ============================================================
@@ -796,7 +1493,7 @@ def import_from_artifacts(benchmarks: dict | None, probe: dict | None,
     seen_at = str((benchmarks or {}).get("captured_at") or "") or _now()
     apps = 0
     for bm in (benchmarks or {}).get("benchmarks", []) or []:
-        if upsert_app(bm, db_path=db_path, seen_at=seen_at):
+        if upsert_app(bm, db_path=db_path, seen_at=seen_at, is_benchmark=True):
             apps += 1
 
     probed_at = str((probe or {}).get("probed_at") or "") or _now()

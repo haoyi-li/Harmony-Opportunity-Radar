@@ -27,9 +27,18 @@ class PromptContractTest(unittest.TestCase):
         self.assertNotIn("audit_user", prompts.PROMPT_TEMPLATES)
 
     def test_filter_template_has_required_placeholders(self):
-        text = prompts.get_prompt("user_filter")
-        self.assertIn("{database_json}", text)
-        self.assertIn("{max_results}", text)
+        user = prompts.get_prompt("user_filter")
+        system = prompts.get_prompt("user_filter_system")
+        self.assertIn("{database_json}", user)
+        self.assertIn("{historical_context}", system)
+
+    def test_filter_contract_is_per_app_verdict(self):
+        user = prompts.get_prompt("user_filter")
+        system = prompts.get_prompt("user_filter_system")
+        self.assertIn("verdict", user)
+        self.assertIn("reject", user)
+        self.assertIn("每一个应用", system)
+        self.assertIn("accept", system)
 
     def test_filter_system_enforces_fact_grounding(self):
         system = prompts.get_prompt("user_filter_system")

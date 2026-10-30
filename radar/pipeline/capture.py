@@ -1,12 +1,18 @@
 # -*- coding: utf-8 -*-
-"""M1 标杆捕获流水线: RSS 拉取 → LLM 精选+JTBD 抽象 → 落盘。
+"""M1 标杆捕获流水线: RSS 拉取 → iTunes 补详情 → 全量目录入库 → LLM 精选。
 
 产物（都在 data/ 下）:
   raw_feed.json    原始榜单全量快照（LLM 处理前，便于复盘/重跑）
   benchmarks.json  精选后的标杆列表（M2 probe 的输入）
+
+数据库分两层写入：所有 RSS 应用（is_benchmark=0）先进入 apps.db 目录层，
+LLM 精选出的标杆再标记 is_benchmark=1；指标变化时追加 app_snapshots。
 """
 import json
+import time
 from datetime import datetime, timezone
+
+import httpx
 
 from radar import database, store, telemetry
 from radar.llm import LLMClient, LLMError
@@ -15,6 +21,7 @@ from radar.prompts import CAPTURE_SYSTEM, CAPTURE_USER
 from radar.sources import apple_rss
 
 STAGE = "capture"
+ITUNES_LOOKUP_URL = "https://itunes.apple.com/lookup"
 
 
 def run(cfg: dict) -> int:
@@ -38,6 +45,12 @@ def run(cfg: dict) -> int:
         # 榜单全挂通常是网络/上游临时故障，归为可重试中断
         raise RetryableAbortError("所有榜单均拉取失败，检查网络后重试")
 
+    # ---- 第 1.5 步: iTunes lookup 补齐目录层详情（无 LLM 成本）----
+    if cap_cfg.get("enrich_itunes", True):
+        telemetry.progress(STAGE, 0, message="iTunes 补全应用详情…")
+        apps = _enrich_with_itunes(apps)
+        print(f"      iTunes 详情补全完成（{len(apps)} 个应用）")
+
     # 原始快照先落盘——即使后续 LLM 失败，也不用重新拉网络
     llm_limit = int(cap_cfg.get("llm_input_limit", 200))
     source_dist: dict[str, int] = {}
@@ -57,6 +70,14 @@ def run(cfg: dict) -> int:
     print(f"      共 {len(apps)} 个应用（去重后），已存 raw_feed.json"
           + (f"，其中前 {llm_limit} 个送入 LLM（已截断）" if truncated else ""))
     telemetry.progress(STAGE, 0, message=f"已拉取 {len(apps)} 个应用")
+
+    # ---- 第 1.8 步: 全量目录先入库（即使 LLM 挂掉，目录资产仍保留）----
+    catalog_stats, catalog_error = _persist_catalog(cfg, apps, _now())
+    if catalog_error:
+        print(f"      [warn] 目录层入库失败：{catalog_error}（JSON 产物仍有效）")
+    else:
+        print(f"      目录层入库 {catalog_stats['catalog']} 个应用，"
+              f"新增快照 {catalog_stats['snapshots']} 条")
 
     # ---- 第 2 步: LLM 精选 + JTBD 抽象 ----
     print(f"[2/3] LLM 精选中（模型: {cfg['llm']['model']}）...")
@@ -78,7 +99,7 @@ def run(cfg: dict) -> int:
         # LLM 挂了不让整条流水线白跑：原始数据已在盘上，给用户明确指引
         raise RetryableAbortError(
             f"LLM 精选失败: {e}\n"
-            f"原始数据已保存在 raw_feed.json，"
+            f"原始数据已保存到 raw_feed.json，全量目录已写入 apps.db；"
             f"修好 LLM 服务（{cfg['llm']['base_url']}）后重跑 capture 即可，无需重新拉取。"
         ) from e
 
@@ -119,31 +140,96 @@ def run(cfg: dict) -> int:
         "benchmarks": benchmarks,
     })
 
-    # ---- 写入本地增量数据库（失败不影响 JSON 产物）----
-    db_count, db_error = _persist_to_database(cfg, benchmarks, captured_at)
+    # ---- 标记 LLM 精选标杆（目录层已在前面入库，不重复计数）----
+    marked, db_error = _persist_benchmarks(cfg, benchmarks, captured_at)
     print(f"[3/3] 完成！精选 {len(benchmarks)} 个标杆，已存 benchmarks.json")
     if db_error:
-        print(f"      [warn] 数据库写入失败：{db_error}（JSON 产物仍有效）")
-    elif db_count:
-        print(f"      已写入本地数据库：{db_count} 个应用新增或刷新")
+        print(f"      [warn] 标杆标记失败：{db_error}（JSON 产物仍有效）")
+    else:
+        print(f"      标杆标记 {marked} 个（目录层 {catalog_stats['catalog']} 个，"
+              f"快照 {catalog_stats['snapshots']} 条）")
     if tel is not None:
         tel.stage_done(STAGE, f"精选 {len(benchmarks)} 个标杆")
     return len(benchmarks)
 
 
-def _persist_to_database(cfg: dict, benchmarks: list[dict],
-                         seen_at: str) -> tuple[int, str]:
-    """把精选标杆写入 SQLite apps 表，返回（入库条数, 错误信息）。"""
+def _enrich_with_itunes(apps: list[dict], batch_size: int = 100,
+                        sleep_s: float = 0.5) -> list[dict]:
+    """批量调用 iTunes lookup 补齐 genre/description/评分等目录层详情。
+
+    失败时保留 RSS 字段静默降级：capture 的主目标是拿到应用清单，
+    详情缺失不应让整轮抓取失败。
+    """
+    targets = [a for a in apps if str(a.get("apple_id", "") or "").strip()]
+    if not targets:
+        return apps
+
+    for start in range(0, len(targets), batch_size):
+        batch = targets[start:start + batch_size]
+        ids = [str(a.get("apple_id")).strip() for a in batch]
+        results: dict[str, dict] = {}
+        for attempt in range(1, 3):
+            try:
+                with httpx.Client(trust_env=False) as client:
+                    resp = client.get(
+                        ITUNES_LOOKUP_URL,
+                        params={"id": ",".join(ids), "country": "cn"},
+                        timeout=20,
+                        follow_redirects=True,
+                    )
+                resp.raise_for_status()
+                results = {str(r.get("trackId", "")): r
+                           for r in resp.json().get("results", [])
+                           if r.get("trackId") is not None}
+                break
+            except (httpx.HTTPError, KeyError, ValueError) as e:
+                if attempt < 2:
+                    time.sleep(min(1.5 ** attempt, 5))
+                else:
+                    print(f"      [warn] iTunes 补详情失败（第 {start // batch_size + 1} 批）: {e}")
+        for app in batch:
+            itunes = results.get(str(app.get("apple_id", "")).strip())
+            if not itunes:
+                continue
+            app["genre"] = itunes.get("primaryGenreName", "") or ""
+            app["description"] = itunes.get("description", "") or ""
+            app["avg_rating"] = itunes.get("averageUserRating")
+            app["rating_count"] = itunes.get("userRatingCount")
+            app["price"] = itunes.get("price")
+            app["release_date"] = itunes.get("releaseDate", "") or ""
+        if start + batch_size < len(targets):
+            time.sleep(sleep_s)
+    return apps
+
+
+def _persist_catalog(cfg: dict, apps: list[dict],
+                     seen_at: str) -> tuple[dict, str]:
+    """把全量目录写入 apps.db，返回（统计, 错误信息）。"""
+    stats = {"catalog": 0, "snapshots": 0}
     try:
         db_path = database.resolve_db_path(cfg)
         database.init_db(db_path)
-        count = database.upsert_benchmarks(benchmarks, db_path=db_path, seen_at=seen_at)
+        result = database.upsert_catalog_apps(apps, db_path=db_path, seen_at=seen_at)
+        stats = {"catalog": result["apps"], "snapshots": result["snapshots"]}
         database.mark_needs_refresh(
             int((cfg.get("database") or {}).get("refresh_threshold_days", 30)),
             db_path=db_path)
         auto_clean = int((cfg.get("database") or {}).get("auto_clean_days", 0) or 0)
         if auto_clean > 0:
             database.clean_old_apps(auto_clean, db_path=db_path)
+        return stats, ""
+    except Exception as e:
+        return stats, str(e)
+
+
+def _persist_benchmarks(cfg: dict, benchmarks: list[dict],
+                        seen_at: str) -> tuple[int, str]:
+    """把 LLM 精选结果标记为 is_benchmark=1（不重复增加 capture_count）。"""
+    try:
+        db_path = database.resolve_db_path(cfg)
+        database.init_db(db_path)
+        count = database.upsert_benchmarks(
+            benchmarks, db_path=db_path, seen_at=seen_at, bump_capture=False)
         return count, ""
     except Exception as e:
         return 0, str(e)
@@ -186,10 +272,19 @@ def _build_benchmark(pick: dict, origin: dict, match: str) -> dict:
         "url": origin.get("url", ""),
         "rank": origin.get("rank"),
         "source_charts": origin.get("source", ""),  # 该标杆在哪些榜单出现
+        "chart_hits": origin.get("source_charts") or [],
+        "genre": origin.get("genre", ""),
+        "description": origin.get("description", ""),
+        "avg_rating": origin.get("avg_rating"),
+        "rating_count": origin.get("rating_count"),
+        "price": origin.get("price"),
+        "release_date": origin.get("release_date", ""),
         "jtbd": pick.get("jtbd", ""),
         "jtbd_confidence": "name_only",  # RSS 字段无法证明功能细节，保守标注
         "search_keywords": pick.get("search_keywords", []),
         "pick_reason": pick.get("pick_reason", ""),
+        "dev_complexity": pick.get("dev_complexity", ""),
+        "monetization_hint": pick.get("monetization_hint", ""),
         "identity_match": match,
     }
 
