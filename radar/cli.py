@@ -168,9 +168,11 @@ def _print_idea_validation(result: dict) -> None:
                      (comp.get("high_freq_pains") or []) +
                      (comp.get("mid_freq_pains") or []) if p.get("issue")]
             pain_txt = "；".join(pains) if pains else "无结构化痛点"
+            rating = comp.get("rating")
+            rating_txt = rating if rating is not None else "—"
+            downloads = comp.get("downloads") or "—"
             print(f"   - {comp.get('name', '?')} "
-                  f"(评分 {comp.get('rating', '—')}, {comp.get('downloads', '—')})"
-                  f"：{pain_txt}")
+                  f"(评分 {rating_txt}, {downloads})：{pain_txt}")
 
 
 def _database_command(args, cfg: dict) -> int:

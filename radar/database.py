@@ -1166,7 +1166,7 @@ def latest_accepted_verdicts(decisions_db_path=None, db_path=None) -> list[dict]
               FROM decisions.app_verdicts GROUP BY apple_id
             ) l ON l.max_id = v.id
             LEFT JOIN apps a ON a.apple_id = v.apple_id
-            WHERE v.verdict='accept'
+            WHERE v.verdict='accept' AND a.apple_id IS NOT NULL
             ORDER BY v.score DESC, v.filtered_at DESC
             """
         ).fetchall()
